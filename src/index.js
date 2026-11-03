@@ -9,8 +9,9 @@ import { VoiceRecorder } from './voice-recorder.js';
 import { ScreenRecorder } from './screen-recorder.js';
 import { driveEnabled, uploadToDrive } from './drive.js';
 
-const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, ALLOWED_USER_IDS = '', SCREEN_DEVICE = '2' } = process.env;
+const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, ALLOWED_USER_IDS = '', SCREEN_DEVICE = '2', AUTO_SCREEN_USER_IDS = '' } = process.env;
 const allowed = ALLOWED_USER_IDS.split(',').map((s) => s.trim()).filter(Boolean);
+const autoScreenUsers = AUTO_SCREEN_USER_IDS.split(',').map((x) => x.trim()).filter(Boolean);
 const UPLOAD_LIMIT = 10 * 1024 * 1024; // default upload cap; bigger files stay on disk
 
 const commands = [
@@ -32,15 +33,35 @@ const screen = new Map(); // guildId -> ScreenRecorder
 const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
 const dirFor = (guildId) => join('recordings', `${guildId}-${stamp()}`);
 
-async function reply(i, file, text) {
+// Drive link if configured, otherwise attach (or report path when too big)
+async function deliver(file, text) {
   if (driveEnabled) {
-    await i.editReply(`${text}\nกำลังอัปโหลดขึ้น Google Drive...`);
     const link = await uploadToDrive(file, `${basename(dirname(file))}-${basename(file)}`);
-    return i.editReply(`${text}\n📁 ${link}`);
+    return { content: `${text}\n📁 ${link}` };
   }
   const size = (await stat(file)).size;
-  if (size > UPLOAD_LIMIT) return i.editReply(`${text}\nไฟล์ใหญ่เกิน ${UPLOAD_LIMIT / 1048576}MB เก็บไว้ที่ \`${file}\``);
-  return i.editReply({ content: text, files: [new AttachmentBuilder(file)] });
+  if (size > UPLOAD_LIMIT) return { content: `${text}\nไฟล์ใหญ่เกิน ${UPLOAD_LIMIT / 1048576}MB เก็บไว้ที่ \`${file}\`` };
+  return { content: text, files: [new AttachmentBuilder(file)] };
+}
+
+async function reply(i, file, text) {
+  if (driveEnabled) await i.editReply(`${text}\nกำลังอัปโหลดขึ้น Google Drive...`);
+  return i.editReply(await deliver(file, text));
+}
+
+// stop the screen recording of a guild and post the result to its text channel
+async function finishScreen(g, text) {
+  const rec = screen.get(g);
+  if (!rec) return;
+  screen.delete(g);
+  const textChannel = rec.textChannel;
+  try {
+    const file = await rec.stop();
+    await textChannel?.send(await deliver(file, text));
+  } catch (e) {
+    console.error(e);
+    await textChannel?.send(`ผิดพลาด: ${String(e.message).slice(0, 1500)}`);
+  }
 }
 
 client.on('interactionCreate', async (i) => {
@@ -59,6 +80,7 @@ client.on('interactionCreate', async (i) => {
       await i.deferReply();
       const rec = new VoiceRecorder(channel, dirFor(g));
       await rec.start();
+      rec.textChannel = i.channel;
       voice.set(g, rec);
       return i.editReply(`🔴 เริ่มอัดเสียงใน **${channel.name}** — ทุกคนในห้องถูกอัดเสียงอยู่`);
     }
@@ -67,6 +89,8 @@ client.on('interactionCreate', async (i) => {
       if (!rec) return i.reply({ content: 'ยังไม่ได้อัด', flags: MessageFlags.Ephemeral });
       await i.deferReply();
       voice.delete(g);
+      const auto = screen.get(g)?.auto;
+      if (auto) await finishScreen(g, '⏹️ อัดหน้าจอที่แชร์เสร็จแล้ว');
       const file = await rec.stop();
       return file ? reply(i, file, '⏹️ อัดเสร็จแล้ว') : i.editReply('⏹️ หยุดอัด แต่ไม่มีใครพูด');
     }
@@ -75,6 +99,7 @@ client.on('interactionCreate', async (i) => {
       await i.deferReply();
       const rec = new ScreenRecorder(dirFor(g), SCREEN_DEVICE);
       await rec.start();
+      rec.textChannel = i.channel;
       screen.set(g, rec);
       return i.editReply('🔴 เริ่มอัดหน้าจอเครื่องที่รันบอท');
     }
@@ -91,6 +116,34 @@ client.on('interactionCreate', async (i) => {
     screen.delete(g);
     const msg = `ผิดพลาด: ${String(e.message).slice(0, 1500)}`;
     return i.deferred || i.replied ? i.editReply(msg) : i.reply({ content: msg, flags: MessageFlags.Ephemeral });
+  }
+});
+
+// while a voice recording is running, someone starting a screen share starts a screen recording
+client.on('voiceStateUpdate', async (oldS, newS) => {
+  const g = newS.guild.id;
+  const rec = voice.get(g);
+  if (!rec || newS.member?.user.bot) return;
+
+  const inRoom = newS.channelId === rec.channel.id;
+  const wasStreaming = oldS.channelId === rec.channel.id && oldS.streaming;
+  const nowStreaming = inRoom && newS.streaming;
+
+  if (!wasStreaming && nowStreaming && !screen.has(g)) {
+    if (autoScreenUsers.length && !autoScreenUsers.includes(newS.id)) return;
+    try {
+      const sr = new ScreenRecorder(dirFor(g), SCREEN_DEVICE);
+      await sr.start();
+      sr.textChannel = rec.textChannel;
+      sr.auto = newS.id;
+      screen.set(g, sr);
+      await rec.textChannel?.send(`🔴 <@${newS.id}> เริ่มแชร์หน้าจอ — เริ่มอัดวิดีโอ`);
+    } catch (e) {
+      console.error(e);
+      await rec.textChannel?.send(`อัดวิดีโอไม่ได้: ${String(e.message).slice(0, 1500)}`);
+    }
+  } else if (wasStreaming && !nowStreaming && screen.get(g)?.auto === newS.id) {
+    await finishScreen(g, '⏹️ หยุดแชร์ — อัดวิดีโอเสร็จแล้ว');
   }
 });
 
