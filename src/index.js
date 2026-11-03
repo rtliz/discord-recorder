@@ -1,12 +1,13 @@
 import 'dotenv/config';
 import { stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import {
   Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes,
   PermissionFlagsBits, AttachmentBuilder, MessageFlags,
 } from 'discord.js';
 import { VoiceRecorder } from './voice-recorder.js';
 import { ScreenRecorder } from './screen-recorder.js';
+import { driveEnabled, uploadToDrive } from './drive.js';
 
 const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, ALLOWED_USER_IDS = '', SCREEN_DEVICE = '2' } = process.env;
 const allowed = ALLOWED_USER_IDS.split(',').map((s) => s.trim()).filter(Boolean);
@@ -32,6 +33,11 @@ const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
 const dirFor = (guildId) => join('recordings', `${guildId}-${stamp()}`);
 
 async function reply(i, file, text) {
+  if (driveEnabled) {
+    await i.editReply(`${text}\nกำลังอัปโหลดขึ้น Google Drive...`);
+    const link = await uploadToDrive(file, `${basename(dirname(file))}-${basename(file)}`);
+    return i.editReply(`${text}\n📁 ${link}`);
+  }
   const size = (await stat(file)).size;
   if (size > UPLOAD_LIMIT) return i.editReply(`${text}\nไฟล์ใหญ่เกิน ${UPLOAD_LIMIT / 1048576}MB เก็บไว้ที่ \`${file}\``);
   return i.editReply({ content: text, files: [new AttachmentBuilder(file)] });
