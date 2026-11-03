@@ -48,3 +48,19 @@ npm start
 - แจ้งทุกคนในห้องก่อนอัดเสียง
 - `/screen` อัดจอเครื่องคุณจริง ใช้ `ALLOWED_USER_IDS` จำกัดคนที่สั่งได้
 - อย่า commit `.env`
+
+## Deploy บน Kubernetes
+
+ใน pod ไม่มีจอ จึงตั้ง `SCREEN_ENABLED=false` (Dockerfile ตั้งไว้ให้แล้ว) คำสั่ง `/screen` และการอัดวิดีโออัตโนมัติจะถูกปิด เหลือเฉพาะ `/record`
+ถ้าต้องการอัดจอ ให้รันบอทแบบ local บนเครื่องที่มีจอแทน
+
+```
+docker build -t REGISTRY/discord-recorder:latest . && docker push REGISTRY/discord-recorder:latest
+kubectl apply -f k8s/deployment.yaml          # แก้ image และ GUILD_ID / GOOGLE_CLIENT_ID ก่อน
+cp k8s/secret.example.yaml k8s/secret.yaml    # กรอกค่าลับ (secret.yaml ห้าม commit)
+kubectl apply -f k8s/secret.yaml
+```
+
+- `replicas: 1` + `Recreate` เพราะเป็น gateway bot รันซ้ำไม่ได้
+- ไฟล์อัดเก็บใน `emptyDir` (หายเมื่อ pod restart) จึงควรตั้งค่า Google Drive ไว้ ไม่อย่างนั้นไฟล์เกิน 10MB จะไม่มีทางส่งออกมา
+- ไฟล์ PCM ดิบใช้ราว 11.5MB/นาที/คนที่พูด ปรับ `sizeLimit` ตามความยาวการประชุม

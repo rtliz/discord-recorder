@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: discord-recorder
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: discord-recorder
+  namespace: discord-recorder
+data:
+  CLIENT_ID: "1567100785282781226"
+  GUILD_ID: ""
+  ALLOWED_USER_IDS: ""
+  GOOGLE_CLIENT_ID: ""
+  DRIVE_FOLDER_ID: "13AKqlzDsTmjIHCCoCfSOkW7pTRYHfTVl"
+  SCREEN_ENABLED: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discord-recorder
+  namespace: discord-recorder
+spec:
+  replicas: 1            # ต้องมีตัวเดียว: gateway bot รันซ้ำจะตอบคำสั่งซ้ำ
+  strategy:
+    type: Recreate       # ไม่ให้ pod เก่า/ใหม่เชื่อม gateway พร้อมกัน
+  selector:
+    matchLabels: { app: discord-recorder }
+  template:
+    metadata:
+      labels: { app: discord-recorder }
+    spec:
+      terminationGracePeriodSeconds: 60   # ให้เวลา mix/อัปโหลดไฟล์ที่ค้างอยู่
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: bot
+          image: REGISTRY/discord-recorder:latest   # แก้เป็น image ของคุณ
+          envFrom:
+            - configMapRef: { name: discord-recorder }
+            - secretRef: { name: discord-recorder }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: recordings, mountPath: /app/recordings }
+      volumes:
+        - name: recordings
+          emptyDir:
+            sizeLimit: 5Gi   # PCM ดิบ ~11.5MB/นาที/คนที่พูด

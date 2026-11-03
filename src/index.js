@@ -9,7 +9,8 @@ import { VoiceRecorder } from './voice-recorder.js';
 import { ScreenRecorder } from './screen-recorder.js';
 import { driveEnabled, uploadToDrive } from './drive.js';
 
-const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, ALLOWED_USER_IDS = '', SCREEN_DEVICE = '2', AUTO_SCREEN_USER_IDS = '' } = process.env;
+const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, ALLOWED_USER_IDS = '', SCREEN_DEVICE = '2', AUTO_SCREEN_USER_IDS = '', SCREEN_ENABLED = 'true' } = process.env;
+const screenEnabled = SCREEN_ENABLED !== 'false'; // false in k8s: no display to capture
 const allowed = ALLOWED_USER_IDS.split(',').map((s) => s.trim()).filter(Boolean);
 const autoScreenUsers = AUTO_SCREEN_USER_IDS.split(',').map((x) => x.trim()).filter(Boolean);
 const UPLOAD_LIMIT = 10 * 1024 * 1024; // default upload cap; bigger files stay on disk
@@ -21,7 +22,7 @@ const commands = [
   new SlashCommandBuilder().setName('screen').setDescription('อัดหน้าจอเครื่องที่รันบอท')
     .addSubcommand((s) => s.setName('start').setDescription('เริ่มอัดหน้าจอ'))
     .addSubcommand((s) => s.setName('stop').setDescription('หยุดอัดและส่งไฟล์วิดีโอ')),
-].map((c) => c.setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).toJSON());
+].filter((c) => screenEnabled || c.name !== 'screen').map((c) => c.setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).toJSON());
 
 await new REST().setToken(DISCORD_TOKEN)
   .put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
@@ -123,7 +124,7 @@ client.on('interactionCreate', async (i) => {
 client.on('voiceStateUpdate', async (oldS, newS) => {
   const g = newS.guild.id;
   const rec = voice.get(g);
-  if (!rec || newS.member?.user.bot) return;
+  if (!screenEnabled || !rec || newS.member?.user.bot) return;
 
   const inRoom = newS.channelId === rec.channel.id;
   const wasStreaming = oldS.channelId === rec.channel.id && oldS.streaming;
