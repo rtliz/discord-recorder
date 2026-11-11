@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>อัดจอส่งให้บอท</title>
+<link rel="stylesheet" href="/static/capture.css">
+</head>
+<body>
+<main class="card">
+  <h1>🎥 อัดจอส่งให้บอท</h1>
+  <p id="hint" class="hint">เลือกจอที่จะอัด แล้วกด แชร์</p>
+  <div id="live" class="live" hidden>
+    <span class="dot" aria-hidden="true"></span>
+    <span class="rec">กำลังอัด</span>
+    <span id="elapsed" class="time">00:00</span>
+    <span id="sent" class="sent">ส่งแล้ว 0.0 MB</span>
+  </div>
+  <p id="msg" class="msg" role="status" aria-live="polite"></p>
+  <div class="actions">
+    <button id="start" type="button" class="btn primary">▶️ เริ่มอัดจอ</button>
+    <button id="stop" type="button" class="btn danger" hidden>⏹️ หยุดอัด</button>
+  </div>
+  <p class="foot">ห้ามปิดแท็บนี้ระหว่างอัด</p>
+</main>
+<script src="/static/capture.js"></script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: discord-recorder
+  namespace: discord-recorder
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    # จำกัดคำขอต่อ IP (บอทไม่มี lockout รวมแล้ว): หน้าอัดจอปกติใช้ไม่ถึง 1 ครั้ง/วินาที
+    # (ส่ง 1 ส่วนทุก 3 วิ + เช็กสถานะทุก 5 วิ) เผื่อ retry ไว้ที่ 10/วิ, burst 5 เท่า
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod   # เปิดถ้าใช้ cert-manager (แก้ชื่อ issuer ให้ตรง)
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [recorder.example.com]          # แก้เป็น host จริง (ต้องตรงกับ PUBLIC_URL)
+      secretName: discord-recorder-tls
+  rules:
+    - host: recorder.example.com             # แก้เป็น host จริง
+      http:
+        paths:
+          # เปิดเฉพาะ path ของหน้าอัดจอ; /healthz และอื่น ๆ ไม่ออกสู่ภายนอก
+          - path: /capture
+            pathType: Prefix
+            backend:
+              service: { name: discord-recorder, port: { name: http } }
+          - path: /static
+            pathType: Prefix
+            backend:
+              service: { name: discord-recorder, port: { name: http } }
+          - path: /api/capture
+            pathType: Prefix
+            backend:
+              service: { name: discord-recorder, port: { name: http } }

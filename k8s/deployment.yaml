@@ -10,11 +10,16 @@ metadata:
   namespace: discord-recorder
 data:
   CLIENT_ID: "1567100785282781226"
-  GUILD_ID: ""
   ALLOWED_USER_IDS: ""
+  ALLOWED_GUILD_IDS: ""                       # server ที่ให้ใช้บอท คั่นด้วย , (ว่าง = ทุก server ที่เชิญ)
   GOOGLE_CLIENT_ID: ""
   DRIVE_FOLDER_ID: "13AKqlzDsTmjIHCCoCfSOkW7pTRYHfTVl"
   SCREEN_ENABLED: "false"
+  # PUBLIC_URL: "https://recorder.example.com"   # ใส่โดเมนจริงแล้วเอา # ออก (ต้องตรงกับ k8s/ingress.yaml) ไม่มี / ท้าย
+  HTTP_PORT: "8080"
+  CAPTURE_MAX_MB: "3072"                      # ต่อการอัดจอ 1 ครั้ง
+  CAPTURE_TOTAL_MB: "8192"                    # รวมทุกการอัดจอที่ยังค้างในเครื่อง (emptyDir 20Gi, ตอนแปลงไฟล์ใช้อีกเท่าตัว)
+  DELETE_AFTER_UPLOAD: "true"                 # อัปโหลด Drive สำเร็จแล้วลบไฟล์ในเครื่อง
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -42,15 +47,43 @@ spec:
           envFrom:
             - configMapRef: { name: discord-recorder }
             - secretRef: { name: discord-recorder }
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
-            requests: { cpu: 100m, memory: 256Mi }
-            limits: { cpu: "1", memory: 1Gi }
+            requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 10Gi }
+            limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 22Gi }
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: recordings, mountPath: /app/recordings }
+            - { name: data, mountPath: /app/data }   # per-server settings (settings.json)
       volumes:
         - name: recordings
           emptyDir:
-            sizeLimit: 5Gi   # PCM ดิบ ~11.5MB/นาที/คนที่พูด
+            sizeLimit: 20Gi   # PCM ดิบ ~11.5MB/นาที/คนที่พูด; video ≈0.9GB/ชม. ต่อคน ×2 ตอนแปลงไฟล์
+        # emptyDir: การตั้งค่าหายเมื่อ pod ถูกสร้างใหม่ ถ้าต้องการให้อยู่ถาวร เปลี่ยนเป็น persistentVolumeClaim
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: discord-recorder
+  namespace: discord-recorder
+spec:
+  type: ClusterIP
+  selector: { app: discord-recorder }
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

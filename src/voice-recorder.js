@@ -14,7 +14,10 @@ import prism from 'prism-media';
 const BYTES_PER_MS = 48000 * 2 * 2 / 1000; // 48kHz s16le stereo
 
 export class VoiceRecorder {
+  static RECONNECT_MS = 5000; // a disconnect that doesn't start reconnecting within this is for good
+
   constructor(channel, dir) {
+    this.kind = 'voice';
     this.channel = channel;
     this.dir = dir;
     this.tracks = new Map(); // userId -> { file, out, written, active }
@@ -29,9 +32,32 @@ export class VoiceRecorder {
       adapterCreator: this.channel.guild.voiceAdapterCreator,
       selfDeaf: false,
     });
-    await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
+    try {
+      await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
+    } catch (e) {
+      this.connection.destroy(); // don't leave a half-open connection for the next join to reuse
+      throw e;
+    }
     this.startedAt = Date.now();
     this.connection.receiver.speaking.on('start', (id) => this.#listen(id));
+    this.watch(this.connection);
+  }
+
+  // kicked, moved away for good, or the network gone: tell the owner (onGone) instead of recording silence.
+  // A move to another channel or a short blip goes back to Signalling/Connecting by itself.
+  watch(connection) {
+    connection.on('stateChange', (_, next) => {
+      if (next.status !== VoiceConnectionStatus.Disconnected || this.stopping || this.gone) return;
+      Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, VoiceRecorder.RECONNECT_MS),
+        entersState(connection, VoiceConnectionStatus.Connecting, VoiceRecorder.RECONNECT_MS),
+      ]).catch(() => {
+        if (this.stopping || this.gone) return;
+        this.gone = true;
+        if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+        this.onGone?.();
+      });
+    });
   }
 
   #track(userId) {
@@ -74,7 +100,9 @@ export class VoiceRecorder {
 
   /** stop, mix all tracks into one mp3, return its path (or null if nobody spoke) */
   async stop() {
-    this.connection.destroy();
+    this.stopping = true;
+    // already destroyed when the bot was dropped from the room (destroy() would throw)
+    if (this.connection.state.status !== VoiceConnectionStatus.Destroyed) this.connection.destroy();
     const tracks = [...this.tracks.values()];
     await Promise.all(tracks.map((t) => new Promise((r) => t.out.end(r))));
     if (!tracks.length) return null;

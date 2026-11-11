@@ -3,3 +3,4 @@ node_modules
 recordings
 .git
 k8s
+data
