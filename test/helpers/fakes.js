@@ -165,13 +165,18 @@ export class FakeVoiceRecorder {
   static instances = [];
   static startHook = null; // async (rec) => {} : await a gate or throw
   constructor(channel, dir) {
-    Object.assign(this, { kind: 'voice', channel, dir, onGone: null, stopped: false, nobodySpoke: false, startedAt: Date.now() });
+    Object.assign(this, { kind: 'voice', channel, dir, onGone: null, stopped: false, nobodySpoke: false, startedAt: 0, recording: false });
     FakeVoiceRecorder.instances.push(this);
   }
-  async start() { await FakeVoiceRecorder.startHook?.(this); this.started = true; }
+  // like VoiceRecorder: joins; record false = in the room but recording nothing until begin()
+  async start({ record = true } = {}) { await FakeVoiceRecorder.startHook?.(this); this.started = true; if (record) this.begin(); }
+  begin(at = Date.now()) {
+    if (this.recording || this.stopped) return;
+    Object.assign(this, { recording: true, startedAt: at });
+  }
   async stop() {
     this.stopped = true;
-    if (this.nobodySpoke) return null;
+    if (!this.recording || this.nobodySpoke) return null; // never began: no track, no file (the real one too)
     await mkdir(this.dir, { recursive: true });
     const f = join(this.dir, 'voice.mp3');
     await writeFile(f, 'mp3');

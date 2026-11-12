@@ -11,7 +11,7 @@ import { assertDiscordLimits } from './helpers/limits.js';
 // link on the card. Never an auto switch while a screen is live; when it stops, another sharer with an agent continues the
 // same session at once. One session per server. Browser-capture mode with FakeAgentHub
 
-const { bot, logs, fire, agents, composed, share } = await loadBot({ SCREEN_ENABLED: 'false', PUBLIC_URL: 'http://localhost:1' });
+const { bot, logs, uploads, fire, agents, composed, share } = await loadBot({ SCREEN_ENABLED: 'false', PUBLIC_URL: 'http://localhost:1' });
 const { T } = await import('../src/browser-capture.js');
 const { updateSettings, getSettings } = await import('../src/settings.js');
 Object.assign(T, { drainMax: 50, silent: 50, poll: 5 });
@@ -46,7 +46,7 @@ const autoLogs = () => logs.out.filter((l) => l.includes('(อัตโนมั
 
 beforeEach(() => {
   bot._reset(); bot.client.guilds.cache.clear(); resetFakes();
-  logs.out.length = 0; logs.err.length = 0; composed.calls.length = 0; bot.T.wait = WAIT;
+  logs.out.length = 0; logs.err.length = 0; composed.calls.length = 0; uploads.length = 0; bot.T.wait = WAIT;
 });
 after(() => bot._reset());
 
@@ -90,7 +90,7 @@ describe('auto start with the sharer\'s agent online', () => {
     await waitFor(() => s.guild.members.me.nickname === 'Keep', 'nickname restored');
   });
 
-  test('(old flow) the bot joins at once while the agent starts; the card says recording (an old agent\'s askFirst is ignored)', async () => {
+  test('the bot joins at once while the agent starts but records nothing; the card says prepare (an old agent\'s askFirst is ignored)', async () => {
     const s = await autoScene();
     agents.setOnline(s.b.id, { askFirst: true });
     agents.startMode = 'hold';
@@ -98,19 +98,22 @@ describe('auto start with the sharer\'s agent online', () => {
     await waitFor(() => agents.pending.length === 1, 'commanded');
     const sess = screen.get(s.guild.id);
     await waitFor(() => sess.paired && voice.get(s.guild.id) === sess.paired, 'joined before the ack');
-    await sess.cardQ;
+    await waitFor(() => content(lastOf(sess.card)).includes('บอทอยู่ในห้องแล้ว'), 'card: joined');
     const card = lastOf(sess.card);
-    assert.match(content(card), new RegExp(`^🔴 \\*\\*กำลังอัดในห้อง Meeting\\*\\*[^\\n]*\\n-# บอทอัดเสียงทุกคนในห้องด้วย\\n⏳ \\*\\*กำลังสั่งเครื่องของ <@${s.b.id}> ให้เริ่มอัดจอ...\\*\\*`));
-    assert.doesNotMatch(content(card), /ถามก่อน/);
-    assert.equal(parts(card)[0].style, 4, 'a red stop: the room records');
+    assert.match(content(card), new RegExp(`^⏳ \\*\\*เตรียมอัดในห้อง Meeting\\*\\*\\n-# บอทอยู่ในห้องแล้ว ยังไม่ได้อัด[^\\n]*\\n⏳ \\*\\*กำลังสั่งเครื่องของ <@${s.b.id}> ให้เริ่มอัดจอ...\\*\\*`));
+    assert.doesNotMatch(content(card), /ถามก่อน|🔴/);
+    assert.equal(parts(card)[0].style, 2, 'a grey cancel: nothing records yet');
+    assert.equal(sess.paired.recording, false);
+    await waitFor(() => s.guild.members.me.nickname?.endsWith(' - ⏳ เตรียมอัด'), 'prepare nickname');
     assertDiscordLimits(card, 'auto starting card');
     agents.ack('ok');
     await liveSession(s, s.b);
     assert.equal(FakeVoiceRecorder.instances.length, 1);
+    assert.equal(sess.paired.startedAt, sess.cur.rec.liveAt, 'the audio starts with the agent\'s video');
   });
 
   for (const how of ['declined', 'busy']) {
-    test(`(old flow) the agent fails (${how}): the audio goes on, the 🎥 link on the card, a note; skipped for auto, never re-commanded until they re-share`, async () => {
+    test(`the agent fails (${how}): still preparing, the 🎥 link on the card, a note; skipped for auto, never re-commanded until they re-share`, async () => {
       const s = await autoScene();
       agents.setOnline(s.b.id);
       agents.plan.push(how);
@@ -120,7 +123,7 @@ describe('auto start with the sharer\'s agent online', () => {
       assert.ok(bot.cardSkip.get(s.guild.id).has(s.b.id), 'skipped for auto');
       await sess.cardQ;
       const card = lastOf(sess.card);
-      assert.match(content(card), /^🔴 \*\*กำลังอัดเสียงในห้อง Meeting\*\* · <@\d+> กด 🎥 เพื่ออัดจอด้วย/);
+      assert.match(content(card), /^⏳ \*\*เตรียมอัดในห้อง Meeting\*\* · <@\d+> กด 🎥 เพื่อเริ่มอัด/);
       assert.match(content(card), /-# ⚠️ /);
       assert.ok(parts(card).some((c) => c.url?.startsWith('http://localhost:1/capture/')));
       // any later event (someone joins, the agent reconnecting) commands nothing
@@ -132,7 +135,9 @@ describe('auto start with the sharer\'s agent online', () => {
       assert.equal(agents.calls.length, 1, 'not commanded again');
       assert.equal(screen.get(s.guild.id), sess);
       share(s.b, false);
-      await resultOf(s, sess);
+      const out = await resultOf(s, sess);
+      assert.match(content(out), /^⚪ \*\*ไม่ได้อัด\*\* — ไม่มีภาพจอ/, 'the link was never opened: nothing recorded');
+      assert.equal(uploads.length + composed.calls.length, 0);
       share(s.b);
       await waitFor(() => agents.calls.length === 2, 'a new share is a new chance');
     });
@@ -237,7 +242,7 @@ describe('filters: the same as cards', () => {
 });
 
 describe('no agent online (old flow)', () => {
-  test('(old flow) the session starts at once: the bot joins, the card says recording with the 🎥 link for the sharer; opening it → live', async () => {
+  test('the session starts at once: the bot joins, the card says prepare with the 🎥 link for the sharer; opening it → live', async () => {
     const s = await autoScene();
     share(s.b);
     const sess = await waitFor(() => screen.get(s.guild.id)?.cur && screen.get(s.guild.id).paired && screen.get(s.guild.id), 'started');
@@ -248,8 +253,8 @@ describe('no agent online (old flow)', () => {
     assert.equal(voice.get(s.guild.id).channel, s.room);
     await sess.cardQ;
     const card = lastOf(sess.card);
-    assert.equal(content(card).split('\n')[0], `🔴 **กำลังอัดเสียงในห้อง Meeting** · <@${s.b.id}> กด 🎥 เพื่ออัดจอด้วย`);
-    assert.match(content(card), /⚡ อัดอัตโนมัติ/);
+    assert.equal(content(card).split('\n')[0], `⏳ **เตรียมอัดในห้อง Meeting** · <@${s.b.id}> กด 🎥 เพื่อเริ่มอัด`);
+    assert.match(content(card), /⚡ อัดอัตโนมัติ .* · ไม่อยากให้อัดกด ✖️$/m);
     const link = parts(card).find((c) => c.url);
     assert.match(link.url, /^http:\/\/localhost:1\/capture\//);
     assert.ok(ids(card).includes('agent:install'), '📥 for next time');

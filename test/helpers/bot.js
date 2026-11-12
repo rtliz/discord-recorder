@@ -16,7 +16,8 @@ export async function loadBot(env = {}) {
     console.warn = console.error;
   }
   const bot = await import('../../src/index.js');
-  const uploads = [];
+  const uploads = []; // the uploaded names; uploads.calls: { name, folders } of every call (not cleared by length = 0: use at(-1))
+  uploads.calls = [];
   const agents = new FakeAgentHub(); // deps.agents / deps.composeMeeting exist from index.js B1 on; before that these are inert keys
   const composeMeeting = fakeComposeMeeting();
   Object.assign(bot.deps, {
@@ -34,9 +35,10 @@ export async function loadBot(env = {}) {
       composeMeeting.fails = bot.deps.composeFails ?? null;
       return composeMeeting(args, opts);
     },
-    uploadToDrive: async (file, name) => {
+    uploadToDrive: async (file, name, folders = []) => {
       if (bot.deps.uploadFails) throw bot.deps.uploadFails;
       uploads.push(name);
+      uploads.calls.push({ name, folders });
       return `https://drive.google.com/file/d/${uploads.length}/view`;
     },
   });

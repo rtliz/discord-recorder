@@ -514,120 +514,18 @@ describe('browser capture', { skip: !hasFfmpeg() && 'ffmpeg not installed' }, ()
     });
   });
 
-  describe('voice-only fallback (U20)', () => {
-    const voice = async (rec, token = tokenOf(rec), headers = {}) => j(await fetch(`${B}/api/capture/${rec.capId}/voice`, {
-      method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify({ token }),
-    }));
-    const withCb = (cb, opts) => Object.assign(fresh(opts), { calls: 0, onVoiceOnly(r) { this.calls++; assert.equal(r, this); return cb(r); } });
-
-    test('manual: { paired:false } -> 200, state voice, offer timer cleared, page/start/second voice 410', async () => {
-      const rec = withCb(() => ({ paired: false }), { offerMs: 60 });
-      assert.deepEqual(await voice(rec), [200, { ok: true, paired: false }]);
-      assert.equal(rec.calls, 1);
-      assert.equal(rec.state, 'voice');
-      await sleep(120); // past offerMs: the cleared timer must not exit it
-      assert.equal(rec.exitReason, undefined);
-      assert.deepEqual(await voice(rec), [410, { stop: true }]); // single use
-      assert.equal(rec.calls, 1);
-      assert.equal((await get(`/capture/${tokenOf(rec)}`)).status, 410);
-      assert.equal((await start(rec, 'video/webm'))[0], 410);
-      assert.equal(rec.lived, 0);
-      assert.equal(await rec.stop(), null); // nothing recorded by the page
-      assert.equal(rec.state, 'done');
-    });
-    test('auto: async { paired:true } -> 200 paired', async () => {
-      const rec = withCb(async () => { await sleep(30); return { paired: true }; });
-      assert.deepEqual(await voice(rec), [200, { ok: true, paired: true }]);
-      assert.equal(rec.state, 'voice');
-      await rec.stop();
-    });
-    test('novoice -> 409 novoice; back to offered, link still claimable from a computer', async () => {
-      const rec = withCb(() => ({ error: 'novoice' }));
-      assert.deepEqual(await voice(rec), [409, { error: 'novoice' }]);
+  describe('no voice-only fallback: a phone records nothing', () => {
+    test('POST /voice is gone (404); the offer stays offered and claimable from a computer', async () => {
+      const rec = fresh();
+      const res = await fetch(`${B}/api/capture/${rec.capId}/voice`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: tokenOf(rec) }),
+      });
+      assert.equal(res.status, 404);
+      assert.equal(rec.voiceOnly, undefined, 'no BrowserCapture.voiceOnly');
       assert.equal(rec.state, 'offered');
-      assert.deepEqual(await voice(rec), [410, { stop: true }]); // still single use
-      assert.equal(rec.calls, 1);
+      assert.equal((await get(`/capture/${tokenOf(rec)}`)).status, 200);
       assert.equal((await start(rec, 'video/webm'))[0], 200);
       await rec.stop().catch(() => {});
-    });
-    test('unset callback / throw / junk result -> 409 voice, offered again', async () => {
-      const bad = [null, () => { throw new Error('join failed'); }, async () => { throw new Error('x'); }, () => undefined, () => ({ ok: true }), () => ({ error: 'other' })];
-      const err = console.error;
-      console.error = () => {}; // the throws are logged on purpose
-      try {
-        for (const cb of bad) {
-          const rec = fresh();
-          rec.onVoiceOnly = cb;
-          assert.deepEqual(await voice(rec), [409, { error: 'voice' }], String(cb));
-          assert.equal(rec.state, 'offered');
-          assert.equal(rec.exitReason, undefined);
-          await rec.stop();
-        }
-      } finally { console.error = err; }
-    });
-    test('offer expires during a failed callback -> exits with the 5-minute reason', async () => {
-      const rec = withCb(async () => { await sleep(120); return { error: 'novoice' }; }, { offerMs: 60 });
-      assert.equal((await voice(rec))[0], 409);
-      assert.equal(rec.exitReason, 'ไม่มีใครกดอัดจอภายใน 5 นาที');
-      assert.equal(await rec.stop(), null);
-    });
-    test('concurrent calls: one callback, the other 410; claim during the callback 410', async () => {
-      let go;
-      const rec = withCb(() => new Promise((r) => { go = r; }));
-      const a = voice(rec);
-      await until(() => rec.state === 'voice');
-      assert.deepEqual(await voice(rec), [410, { stop: true }]);
-      assert.equal((await start(rec, 'video/webm'))[0], 410);
-      go({ paired: false });
-      assert.deepEqual(await a, [200, { ok: true, paired: false }]);
-      assert.equal(rec.calls, 1);
-      await rec.stop();
-    });
-    test('410 after claim; after stop(); after exit()', async () => {
-      const claimed = withCb(() => ({ paired: false }));
-      assert.equal((await start(claimed, 'video/webm'))[0], 200);
-      assert.deepEqual(await voice(claimed), [410, { stop: true }]);
-      const stopped = withCb(() => ({ paired: false }));
-      const tok = tokenOf(stopped);
-      await stopped.stop();
-      assert.deepEqual(await voice(stopped, tok), [410, { stop: true }]);
-      const exited = withCb(() => ({ paired: false }));
-      exited.exit('x');
-      assert.deepEqual(await voice(exited), [410, { stop: true }]);
-      assert.equal(claimed.calls + stopped.calls + exited.calls, 0);
-      await claimed.stop().catch(() => {}); await exited.stop();
-    });
-    test('bad token: tampered 410, other capture 400, expired 410, missing 400; callback never runs', async () => {
-      const rec = withCb(() => ({ paired: false }), { offerMs: 0 });
-      const other = fresh({ offerMs: 0 });
-      const t = tokenOf(rec);
-      assert.deepEqual(await voice(rec, `${t.slice(0, -1)}${t.at(-1) === 'A' ? 'B' : 'A'}`), [410, { stop: true }]);
-      assert.deepEqual(await voice(rec, tokenOf(other)), [400, { error: 'token' }]);
-      assert.deepEqual(await voice(rec, rec.link(-1000).split('/capture/')[1]), [410, { stop: true }]);
-      assert.equal((await voice(rec, 42))[0], 400);
-      assert.equal(rec.calls, 0);
-      assert.equal(rec.state, 'offered');
-      await rec.stop(); await other.stop();
-    });
-    test('HTTP rules: evil Origin 403, own 200; GET 405; non-JSON 415; >1 KB 413; unknown capId 404', async () => {
-      const evil = withCb(() => ({ paired: false }));
-      assert.deepEqual(await voice(evil, tokenOf(evil), { origin: 'https://evil.example' }), [403, { error: 'origin' }]);
-      assert.deepEqual(await voice(evil, tokenOf(evil), { origin: ORIGIN }), [200, { ok: true, paired: false }]);
-      const rec = withCb(() => ({ paired: false }));
-      const path = `/api/capture/${rec.capId}/voice`;
-      assert.equal((await get(path)).status, 405);
-      assert.equal(await raw(path, { method: 'POST', headers: { 'content-type': 'text/plain' }, body: '{}' }), 415);
-      assert.equal(await raw(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: 'x'.repeat(2000) }) }), 413);
-      assert.equal((await fetch(`${B}/api/capture/${'A'.repeat(22)}/voice`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 404);
-      assert.equal(rec.calls, 0);
-      await evil.stop(); await rec.stop();
-    });
-    test('rate-limited by the per-capture bucket: 30 fast calls -> some 429', async () => {
-      const rec = withCb(() => ({ paired: false }));
-      const codes = await Promise.all(Array.from({ length: 30 }, () => voice(rec, 'x').then(([s]) => s)));
-      assert.ok(codes.includes(429), codes.join(','));
-      assert.equal(rec.calls, 0);
-      await rec.stop();
     });
   });
 

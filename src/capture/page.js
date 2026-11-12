@@ -22,29 +22,13 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const auth = () => ({ Authorization: `Bearer ${session}` });
 
-  // U20: a phone can't capture, so the bot records the voice room instead (single use, server decides)
-  const NOCAP = '📱 อุปกรณ์นี้อัดจอไม่ได้ ใช้คอมพิวเตอร์แทน';
-  async function voiceFallback() {
-    try {
-      const res = await fetch(`${api}/voice`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }),
-      });
-      const r = await res.json().catch(() => ({}));
-      if (res.ok && r.ok) {
-        return [r.paired ? '📱 อุปกรณ์นี้อัดจอไม่ได้ — บอทอัดเสียงในห้องอยู่แล้ว ปิดหน้านี้ได้'
-          : '📱 อุปกรณ์นี้อัดจอไม่ได้ — บอทอัดเสียงในห้องให้แทนแล้ว ดูผลใน Discord', 'ok'];
-      }
-      if (r.error === 'novoice') return ['📱 อุปกรณ์นี้อัดจอไม่ได้ และคุณไม่ได้อยู่ในห้องเสียง', 'err'];
-    } catch { /* offline: same as failed */ }
-    return [NOCAP, 'err'];
-  }
+  // a phone can't capture: say so. Nothing is recorded instead (audio only is 🎙️ อัดเสียง in Discord), and the link
+  // stays unclaimed, so it still works from a computer
+  const NOCAP = '📱 อุปกรณ์นี้อัดจอไม่ได้ — เปิดลิงก์นี้จากคอมพิวเตอร์ หรือกด 🎙️ อัดเสียง ใน Discord ถ้าจะอัดแค่เสียง';
   if (!navigator.mediaDevices?.getDisplayMedia || typeof MediaRecorder === 'undefined') {
     startBtn.hidden = true;
     hint.hidden = true;
-    if (!token) return say(NOCAP, 'err');
-    say('📱 อุปกรณ์นี้อัดจอไม่ได้ — กำลังให้บอทอัดเสียงแทน…'); // joining a room can take a while
-    voiceFallback().then(([text, kind]) => say(text, kind));
-    return;
+    return say(NOCAP, 'err');
   }
 
   // High profile level 4.0 first (1080p+ at 30 fps); Baseline as fallback for browsers without it
@@ -177,9 +161,7 @@
       if (e?.name === 'NotSupportedError') { // a phone browser that exposes getDisplayMedia but rejects it: same as having none
         startBtn.hidden = true;
         hint.hidden = true;
-        if (!token) return say(NOCAP, 'err');
-        say('📱 อุปกรณ์นี้อัดจอไม่ได้ — กำลังให้บอทอัดเสียงแทน…');
-        return voiceFallback().then(([text, kind]) => say(text, kind));
+        return say(NOCAP, 'err');
       }
       if (auto) return say('');
       say(e?.name === 'NotAllowedError' ? 'ยกเลิกการเลือกจอ กดเริ่มใหม่ได้' : 'เปิดการอัดจอไม่ได้ ลองใหม่อีกครั้ง', 'err');

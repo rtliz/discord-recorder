@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { stat, rm, mkdir } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { join, basename, dirname } from 'node:path';
+import { join, basename, dirname, extname } from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, ActivityType,
@@ -18,7 +18,7 @@ import { mergeAudio } from './merge.js';
 import { composeMeeting, pending as composePending } from './compose.js';
 import { hub } from './agent-hub.js';
 import { ACK_ERROR } from './agent/protocol.js';
-import { driveEnabled, uploadToDrive } from './drive.js';
+import { driveEnabled, uploadToDrive, safeName } from './drive.js';
 import { getSettings, updateSettings } from './settings.js';
 import { configView, configPageOf, applyConfig, summary, inSchedule, cardsLabel, shareModeOf } from './config-ui.js';
 
@@ -34,9 +34,12 @@ const modes = browserScreen ? ['agent', 'browser'] : macScreen ? ['screen', 'win
 const modeOf = (s) => (modes.includes(s.mode) ? s.mode : modes[0]); // same rule as config-ui's effective mode
 const isMac = (mode) => mode === 'screen' || mode === 'window';
 const useAgent = (g) => modeOf(getSettings(g)) === 'agent'; // may this server's starts command an agent
-// a browser capture waiting for its sharer, or one whose phone couldn't capture ('voice', U20), isn't recording video;
-// a session is live while its current segment is
-const live = (r) => (r.kind === 'session' ? Boolean(r.cur && live(r.cur.rec)) : r.state !== 'offered' && r.state !== 'voice');
+// a browser capture waiting for its sharer isn't recording video; a session is live while its current segment is
+const live = (r) => (r.kind === 'session' ? Boolean(r.cur && live(r.cur.rec)) : r.state !== 'offered');
+// a session records once a screen has been live (a link opened, an agent or the host Mac started). Before that it only
+// prepares: the bot sits in the room recording nothing, and an end then leaves nothing (audio only is 🎙️'s alone)
+const recorded = (sess) => sess.segments.some((x) => x.source === SESSION.mac || x.rec.liveAt);
+const prepping = (r) => r?.kind === 'session' && !recorded(r);
 const list = (v) => v.split(',').map((x) => x.trim()).filter(Boolean);
 const allowed = list(ALLOWED_USER_IDS);
 const autoScreenUsers = list(AUTO_SCREEN_USER_IDS);
@@ -155,7 +158,6 @@ const liveCard = (rec) => {
     content: [
       head,
       ...(rec.kind === 'voice' ? ['-# ทุกคนในห้องถูกอัดเสียงอยู่'] : rec.paired ? ['-# บอทอัดเสียงทุกคนในห้องด้วย'] : []),
-      ...(rec.note ? [rec.note] : []), // e.g. why a screen recording became voice only (U20)
     ].join('\n'),
     components: [new ActionRowBuilder().addComponents(stopBtn(rec.kind === 'voice' ? 'record:stop' : 'screen:stop', rec.began))],
     ...quiet,
@@ -180,14 +182,17 @@ const roomCardOf = (rc) => ({
 function sessionCard(sess) {
   const g = sess.guildId, guild = client.guilds.cache.get(g), room = sess.room.name;
   const seg = sess.cur, rec = seg?.rec, p = sess.pending;
-  const audio = Boolean(sess.paired) && voice.get(g) === sess.paired; // the room is being recorded
+  const prep = !recorded(sess); // no screen yet: the bot waits in the room, nothing records
+  const audio = Boolean(sess.paired) && voice.get(g) === sess.paired && sess.paired.recording; // the room is being recorded
   const joining = sess.joinState === 'joining'; // the bot joins the room as the session starts (not after the screen)
-  const voiceLine = audio ? '-# บอทอัดเสียงทุกคนในห้องด้วย' : joining ? '-# ⏳ บอทกำลังเข้าห้องเพื่ออัดเสียง...' : null;
+  const voiceLine = audio ? '-# บอทอัดเสียงทุกคนในห้องด้วย' : joining ? '-# ⏳ บอทกำลังเข้าห้อง...'
+    : prep && sess.joinState === 'ok' ? '-# บอทอยู่ในห้องแล้ว ยังไม่ได้อัด · เสียงในห้องเริ่มอัดพร้อมภาพจอ' : null;
   const lines = [];
   let top = [], more = [];
-  // a red stop once something records (or the room audio is on its way); before that a grey cancel
-  const stop = audio || joining || (rec && live(rec)) ? stopBtn('screen:stop', sess.began)
+  // a red stop once something records; before that (prepare) a grey cancel
+  const stop = audio || (rec && live(rec)) ? stopBtn('screen:stop', sess.began)
     : button('screen:stop', sess.began, { label: '✖️ ไม่อัด', style: ButtonStyle.Secondary });
+  const prepHead = `⏳ **เตรียมอัดในห้อง ${room}**`;
   const others = sharing(sess).filter((u) => u !== seg?.owner && u !== p?.owner);
   const starting = p && `⏳ **กำลัง${p.source === SESSION.agent ? `สั่งเครื่องของ <@${p.owner}> ให้เริ่มอัดจอ` : `เริ่มอัดจอของ <@${p.owner}>`}...**`;
   if (sess.state === SESSION.waiting) {
@@ -198,23 +203,25 @@ function sessionCard(sess) {
       more = peopleButtons(guild, others, (u) => `screen:cont:${sess.began}.${u}`, (n) => `🔴 อัดจอ ${n} ต่อ`);
     }
     top = [button('screen:stop', sess.began, { label: '⏹️ จบ', style: ButtonStyle.Danger })];
-  } else if (!seg) { // just started: the room audio and the first screen start together (or the screen failed: audio only)
-    lines.push(`🔴 **กำลังอัด${p ? '' : 'เสียง'}ในห้อง ${room}** · เริ่ม ${ago(sess.began)}`);
+  } else if (!seg) { // just started: the bot joins while the first screen starts; nothing records until it is live
+    lines.push(prep ? prepHead : `🔴 **กำลังอัดเสียงในห้อง ${room}** · เริ่ม ${ago(sess.began)}`);
     if (voiceLine) lines.push(voiceLine);
     if (p) lines.push(starting);
     top = [stop];
   } else {
-    if (rec.kind === 'browser' && rec.via !== 'agent' && !live(rec)) { // the card link, not opened yet (or a phone)
-      lines.push(`🔴 **กำลังอัดเสียงในห้อง ${room}**${rec.state === 'voice' ? '' : ` · <@${seg.owner}> กด 🎥 เพื่ออัดจอด้วย`}`);
+    if (rec.kind === 'browser' && rec.via !== 'agent' && !live(rec)) { // the card link, not opened yet
+      // before any screen: nothing records until they share. After one (🔴 ต่อ / 🔁 to a link): the room audio goes on
+      const tail = prep ? 'ยังไม่ได้อัดอะไร' : 'ระหว่างนี้อัดเสียงในห้องต่อ';
+      lines.push(prep ? `${prepHead} · <@${seg.owner}> กด 🎥 เพื่อเริ่มอัด` : `🔴 **กำลังอัดเสียงในห้อง ${room}** · <@${seg.owner}> กด 🎥 เพื่ออัดจอด้วย`);
       if (joining) lines.push(voiceLine);
-      if (rec.state === 'voice') lines.push(`-# <@${seg.owner}> เปิดลิงก์จากมือถือ เลยอัดได้แค่เสียง`);
-      else if (seg.private) lines.push(`-# 🎥 ส่งลิงก์อัดจอให้ <@${seg.owner}> แล้ว (เห็นคนเดียว) · ไม่เปิดก็ได้เสียงอย่างเดียว`);
+      if (seg.private) lines.push(`-# 🎥 ส่งลิงก์อัดจอให้ <@${seg.owner}> แล้ว (เห็นคนเดียว) · ${tail}`);
       else {
-        lines.push(`-# 🎥 กด **อัดจอของฉันด้วย** → เลือกจอ → กด **แชร์** · ปุ่มนี้สำหรับ <@${seg.owner}> · ไม่กดก็ได้เสียงอย่างเดียว`);
-        top.push(linkButton('🎥 อัดจอของฉันด้วย', cardLink(rec)));
+        const label = prep ? 'เริ่มอัดจอของฉัน' : 'อัดจอของฉันด้วย';
+        lines.push(`-# 🎥 กด **${label}** → เลือกจอ → กด **แชร์** · ปุ่มนี้สำหรับ <@${seg.owner}> · ${tail}`);
+        top.push(linkButton(`🎥 ${label}`, cardLink(rec)));
         if (useAgent(g)) top.push(button('agent:install')); // mode agent without their agent: the next time it can be
       }
-      if (seg.auto) lines.push('-# ⚡ อัดอัตโนมัติ (ตั้งค่าไว้ให้อัดเมื่อมีคนแชร์จอ) · ไม่อยากให้อัดกด ⏹️');
+      if (seg.auto) lines.push(`-# ⚡ อัดอัตโนมัติ (ตั้งค่าไว้ให้อัดเมื่อมีคนแชร์จอ) · ไม่อยากให้อัดกด ${prep ? '✖️' : '⏹️'}`);
     } else {
       lines.push(`🔴 **กำลังอัด${rec.kind === 'mac' ? `${rec.what}เครื่องบอท** — <@${seg.owner}> แชร์จอ` : `จอของ <@${seg.owner}>**`}`
         + ` ในห้อง **${room}** · เริ่ม ${ago(sess.began)}`);
@@ -307,7 +314,7 @@ const showCard = renderCard;
 // the live card as of when it gets written; nothing once the recording is finishing (its own messages follow)
 const liveCardOf = (rec) => () => (rec.finished ? null : liveCard(rec));
 
-// a start nobody should see yet: a private link offer (a session is public from its start: it records the room at once)
+// a start nobody should see yet: a private link offer (a session is public from its start: the bot joins the room at once)
 const hiddenStart = (r) => !live(r) && Boolean(r.private);
 // people in this server's voice rooms whose recorder agent is online (the panel shows who can be recorded)
 const agentsOnline = (guild) => [...guild.voiceStates.cache.values()].filter((vs) => vs.channelId && !vs.member?.user.bot && deps.agents.online(vs.id))
@@ -322,16 +329,16 @@ const panel = (guild) => {
   const paired = Boolean(sc && v && sc.paired === v); // the room's audio belongs to the screen recording
   const agents = browserScreen ? agentsOnline(guild) : [];
   const offered = Boolean(sc && !live(sc));           // link sent, the sharer hasn't started the page yet
-  const phone = sc?.state === 'voice';                // the sharer's phone can't capture: only the room audio (U20)
   const sess = sc?.kind === 'session' ? sc : null;
+  const prep = prepping(sess);                        // no screen yet: the bot waits in the room, nothing records
   const status = sess ? [ // a pressed share: whose screen, or waiting for the next one (B3 polishes this)
     sess.state === SESSION.waiting ? `⏸️ รอเลือกจอถัดไปในห้อง **${sess.room.name}**${paired ? ' · เสียงยังอัดอยู่' : ''}`
       : live(sess) ? `🔴 อัดจอของ <@${sess.owner}> · ห้อง **${sess.room.name}** · เริ่ม ${ago(sess.began)}${paired ? ' · อัดเสียงในห้องด้วย' : ''}`
-        : [paired && `🔴 อัดเสียงในห้อง **${sess.room.name}**`, // a phone took the link (U20): only the room audio
-          sess.cur?.rec.state !== 'voice' && `🟡 รอเริ่มอัดจอ${sess.owner ? `ของ <@${sess.owner}>` : ''}`].filter(Boolean).join(' · '),
+        : prep ? `⏳ เตรียมอัดในห้อง **${sess.room.name}** · รอภาพจอ${sess.owner ? `ของ <@${sess.owner}>` : ''} (ยังไม่ได้อัด)`
+          : [paired && `🔴 อัดเสียงในห้อง **${sess.room.name}**`, `🟡 รอเริ่มอัดจอ${sess.owner ? `ของ <@${sess.owner}>` : ''}`].filter(Boolean).join(' · '),
   ] : [
-    v && (!paired || phone) ? `🔴 อัดเสียงในห้อง **${v.channel.name}** · เริ่ม ${ago(v.began)}` : null,
-    offered && !phone ? `${paired ? `🔴 อัดเสียงในห้อง **${v.channel.name}** · ` : ''}🟡 รอ <@${sc.owner}> เปิดหน้าอัดจอแล้วกด ▶️` : null,
+    v && !paired ? `🔴 อัดเสียงในห้อง **${v.channel.name}** · เริ่ม ${ago(v.began)}` : null,
+    offered ? `${paired ? `🔴 อัดเสียงในห้อง **${v.channel.name}** · ` : ''}🟡 รอ <@${sc.owner}> เปิดหน้าอัดจอแล้วกด ▶️` : null,
     sc && !offered ? `🔴 อัดจอ${sc.owner ? `ของ <@${sc.owner}>` : ''} · เริ่ม ${ago(sc.liveAt ?? sc.began)}`
       + `${paired ? ` · อัดเสียงในห้อง **${v.channel.name}** ด้วย` : ''}` : null,
   ].filter(Boolean);
@@ -344,7 +351,7 @@ const panel = (guild) => {
   const actions = [
     ...(!v && !startingVoice.has(g) && !sess ? [button('record:start')] : []), // a session brings its own room audio
     ...(voiceStop ? [two ? button('record:stop') : stopBtn('record:stop')] : []),
-    ...(sc ? [offered && !paired ? button('screen:stop', null, { label: '✖️ ยกเลิกอัดจอ', style: ButtonStyle.Secondary })
+    ...(sc ? [offered && (!paired || prep) ? button('screen:stop', null, { label: '✖️ ยกเลิกอัดจอ', style: ButtonStyle.Secondary })
       : two ? button('screen:stop') : stopBtn('screen:stop')]
       // D12: with PUBLIC_URL 🖥️ (their agent) and 🌐 (a link); without it the host Mac's 🖥️
       : browserScreen ? [button('screen:me'), button('screen:link')] : macScreen ? [button('screen:start')] : []),
@@ -385,17 +392,20 @@ function refreshPanels(guild) {
 // the bot's own status (visible when you click its name)
 function updatePresence() {
   const screens = [...screen.values()].filter(live).length; // an unanswered offer isn't recording
-  const busy = voice.size + screens > 0;
-  const what = [screens && 'จอ', voice.size && 'เสียง'].filter(Boolean).join(' + ');
+  const voices = [...voice.values()].filter((v) => v.recording).length; // a session's prepared room audio isn't either
+  const busy = voices + screens > 0;
+  const what = [screens && 'จอ', voices && 'เสียง'].filter(Boolean).join(' + ');
   client.user?.setPresence({
     status: busy ? 'dnd' : 'online',
     activities: [{ type: ActivityType.Custom, name: 'status', state: busy ? `🔴 กำลังอัด${what}` : '⚪ พร้อมอัด · พิมพ์ @Recorder เพื่อเปิดแผงควบคุม' }],
   });
 }
 
-// the bot's nickname in each server says who is recording: "<ชื่อคนที่กดอัด> - 🔴 กำลังอัดหน้าจอ"
-// (needs Change Nickname). The nickname from before is remembered and put back when recording stops.
-const NICK_TAG = / - 🔴 (?:กำลังอัด|อัดจออัตโนมัติ).*$/u;
+// the bot's nickname in each server says who is recording: "<ชื่อคนที่กดอัด> - 🔴 กำลังอัดหน้าจอ", or that a session
+// waits for its first screen: "<ชื่อ> - ⏳ เตรียมอัด" (needs Change Nickname). The nickname from before is remembered
+// and put back when recording stops.
+const NICK_TAG = / - (?:🔴 (?:กำลังอัด|อัดจออัตโนมัติ)|⏳ เตรียมอัด).*$/u;
+const PREP = 'เตรียมอัด';
 const nickBefore = new Map(); // guildId -> nickname before we changed it (null = none); also in settings (restarts)
 const nickQueue = new Map();  // guildId -> promise: one nickname change at a time per server
 const nickWarned = new Set(); // guildIds already told about a missing Change Nickname (once is enough)
@@ -403,7 +413,7 @@ const nickWarned = new Set(); // guildIds already told about a missing Change Ni
 // joined emoji is never cut in half)
 const graphemes = (s) => [...new Intl.Segmenter('th', { granularity: 'grapheme' }).segment(s)].map((x) => x.segment);
 export function nickFor(name, status) {
-  const tail = ` - 🔴 ${status}`;
+  const tail = ` - ${status === PREP ? '⏳' : '🔴'} ${status}`;
   const g = graphemes(name);
   while (g.length && g.join('').length + tail.length > 32) g.pop();
   return g.join('').trimEnd() + tail;
@@ -413,10 +423,11 @@ function updateNick(guild) {
   const run = async () => {
     const me = guild.members.me;
     if (!me) return;
-    const sc = screen.get(g), v = voice.get(g);
-    const rec = sc && live(sc) ? sc : sc && hiddenStart(sc) ? null : v; // a private start tags nothing until it records
+    const sc = screen.get(g), v = voice.get(g), prep = prepping(sc);
+    // a private start tags nothing until it records; a session before its first screen says it prepares
+    const rec = prep || (sc && live(sc)) ? sc : sc && hiddenStart(sc) ? null : v;
     // an auto-started screen says so (same length as กำลังอัดหน้าจอ: the 32-unit cap keeps the same room for the name)
-    const status = !rec ? null : rec === sc ? (sc.cur?.auto ? 'อัดจออัตโนมัติ' : 'กำลังอัดหน้าจอ') : 'กำลังอัดเสียง';
+    const status = !rec ? null : prep ? PREP : rec === sc ? (sc.cur?.auto ? 'อัดจออัตโนมัติ' : 'กำลังอัดหน้าจอ') : 'กำลังอัดเสียง';
     let want;
     if (status) {
       // our own tagged name left over from a restart is not worth restoring
@@ -425,8 +436,8 @@ function updateNick(guild) {
         nickBefore.set(g, !NICK_TAG.test(me.nickname ?? '') ? me.nickname ?? null : saved !== undefined ? saved : null);
         updateSettings(g, { nickBefore: nickBefore.get(g) });
       }
-      // whose screen is recorded / who pressed (a session waiting for the next screen: its presser, D13)
-      const id = rec.owner ?? rec.by ?? (sc?.paired === rec ? sc.owner ?? sc.by : null);
+      // whose screen is recorded / who pressed (a session preparing or waiting for the next screen: its presser, D13)
+      const id = prep ? sc.by : rec.owner ?? rec.by ?? (sc?.paired === rec ? sc.owner ?? sc.by : null);
       const name = (id && /^\d+$/.test(id) && guild.members.cache.get(id)?.displayName)
         || nickBefore.get(g) || client.user.username;
       want = nickFor(name, status);
@@ -497,8 +508,29 @@ function trackVoice(g, rec) {
   voice.set(g, rec);
   armMax(rec, finishVoice);
   stateChanged(g);
-  rlog(g, `🎙️ เริ่มอัดเสียง ห้อง ${rec.channel.name}${rec.by ? ` โดย ${who(rec.by)}` : ''}${rec.pairedTo ? ' (คู่กับอัดจอ)' : ''}`);
+  rlog(g, rec.recording ? `🎙️ เริ่มอัดเสียง ห้อง ${rec.channel.name}${rec.by ? ` โดย ${who(rec.by)}` : ''}${rec.pairedTo ? ' (คู่กับอัดจอ)' : ''}`
+    : `⏳ บอทเข้าห้อง ${rec.channel.name} เตรียมอัด (ยังไม่อัดจนกว่าภาพจอขึ้น)`);
 }
+
+// a session's first live screen: its room audio (joined, silent until now) starts on the video's clock, so compose
+// needs no offset guess. Idempotent; a join still on its way starts it when it lands (joinSession)
+function startAudio(sess) {
+  const g = sess.guildId, v = sess.paired;
+  if (!sess.videoAt || !v || voice.get(g) !== v || v.recording || screen.get(g) !== sess || sess.finished) return;
+  v.begin(sess.videoAt);
+  rlog(g, `🎙️ เริ่มอัดเสียง ห้อง ${v.channel.name} (คู่กับอัดจอ)`);
+  v.notice?.edit(noticeOf(v)).catch(() => {});
+  stateChanged(g);
+}
+// only an accepted, live segment counts (an agent that claims and then fails its ack is discarded and starts nothing).
+// An agent is accepted after its ack: the audio clock is still its liveAt, so the ack window is padded as silence and
+// audio and video stay aligned (at most the ack time of speech is not captured)
+const videoLive = (sess, at) => { sess.videoAt ??= at; startAudio(sess); };
+// the "this room is recorded" message in the room itself (when the card lives elsewhere); a prepared one says so
+const noticeOf = (v) => (v.recording
+  ? { content: '🔴 **ห้องนี้กำลังถูกอัดเสียง**', components: [new ActionRowBuilder().addComponents(stopBtn('record:stop', v.began))] }
+  : { content: '⏳ **บอทเข้าห้องนี้เพื่อเตรียมอัด** · ยังไม่ได้อัด เริ่มอัดเมื่อภาพจอขึ้น',
+    components: [new ActionRowBuilder().addComponents(button('record:stop', v.began, { label: '✖️ ไม่อัด', style: ButtonStyle.Secondary }))] });
 
 // the bot was kicked from the room or lost its connection: a voice recording ends; the room audio of a
 // screen recording stops where it is (delivered with the video), the video goes on
@@ -508,12 +540,13 @@ function voiceGone(rec) {
   rlog(g, `⚠️ บอทหลุดจากห้องเสียง ${rec.channel.name}`);
   const owner = rec.pairedTo;
   if (owner && screen.get(g) === owner) {
-    if (owner.kind === 'session') { // case 16: live video goes on with a note; no video right now (waiting, link unopened): end
+    if (owner.kind === 'session') { // case 16: live video goes on with a note; no video right now (waiting, link unopened,
+      // preparing): end (a session that never had a screen ends with nothing)
       if (owner.state === SESSION.waiting || !live(owner)) return finishSession(owner, '⚠️ บอทหลุดจากห้องเสียง').catch(console.error);
       owner.notes += '\n⚠️ บอทหลุดจากห้องเสียงกลางทาง เสียงมีถึงตอนนั้น';
       return;
     }
-    // an offer nobody opened (or a phone, U20) has no video: the room audio was all of it, so end it now
+    // an offer nobody opened has no video: end it now
     if (owner.kind === 'browser' && !owner.liveAt) return finishScreen(owner, '⚠️ บอทหลุดจากห้องเสียง').catch(console.error);
     owner.notes = `${owner.notes ?? ''}\n⚠️ บอทหลุดจากห้องเสียงกลางทาง เสียงมีถึงตอนนั้น`; // live video goes on
     return;
@@ -539,6 +572,9 @@ function trackScreen(g, rec) {
   }).catch(console.error);
 }
 
+// room audio recorded alongside a screen that left no video file: not delivered on its own, so not kept either
+const dropAudio = (file) => rm(dirname(file), { recursive: true, force: true }).catch(console.error);
+
 // upload (Drive) or attach the files of one recording: [[path, buttonLabel], ...]
 // each file on its own: one failed upload doesn't cost the others
 // for the log: each file → its Drive link, "แนบ/ในเครื่อง", or the failure
@@ -546,15 +582,36 @@ const logFiles = (files, out) => files.map(([f], i) => `${basename(f)} → ${out
 
 const driveExpired = (e) => /invalid_grant/.test(e?.message ?? '') || e?.response?.data?.error === 'invalid_grant';
 
-async function deliver(files) {
+// Drive layout: <server>/<2026-11-12 11.06 <voice channel>[ (เสียง)|(วิดีโอ n)].ext>, the time is when the recording began
+// (TIMEZONE). ctx: { guild, room (voice channel), at }. Names are unique within one delivery
+function driveNames(files, { guild, room, at = Date.now() }) {
+  const when = new Date(at).toLocaleString('sv-SE', { timeZone: process.env.TIMEZONE || 'Asia/Bangkok' }).slice(0, 16).replace(':', '.');
+  const rname = safeName(room?.name, room?.id ?? 'Recording');
+  const isAudio = (f) => extname(f).toLowerCase() === '.mp3';
+  const videos = files.filter(([f]) => !isAudio(f)).length;
+  let v = 0;
+  const used = new Set();
+  const names = files.map(([f]) => {
+    const kind = isAudio(f) ? ' (เสียง)' : videos > 1 ? ` (วิดีโอ ${++v})` : '';
+    const stem = `${when} ${rname}${kind}`;
+    let name = `${stem}${extname(f)}`;
+    for (let n = 2; used.has(name); n++) name = `${stem} (${n})${extname(f)}`;
+    used.add(name);
+    return name;
+  });
+  return { names, folders: [safeName(guild?.name, guild?.id ?? 'Server')] };
+}
+
+async function deliver(files, ctx = {}) {
+  const { names, folders } = driveNames(files, ctx);
   const links = [], attach = [], notes = [], urls = []; // urls[i]: Drive link of files[i], or null
   let failed = 0, expired = false;
-  for (const [file, text] of files) {
+  for (const [k, [file, text]] of files.entries()) {
     urls.push(null);
     try {
       if (driveEnabled) {
         try {
-          urls[urls.length - 1] = await deps.uploadToDrive(file, `${basename(dirname(file))}-${basename(file)}`);
+          urls[urls.length - 1] = await deps.uploadToDrive(file, names[k], folders);
           links.push(linkButton(text, urls[urls.length - 1]));
         } catch (e) { // Drive is down or its token expired: a small file still reaches people as an attachment
           console.error(e);
@@ -660,17 +717,17 @@ async function finishScreen(rec, reason) {
   const merged = videoFile !== (gotVideo ? video.value : null); // the merged file already holds the room audio
   const files = [
     ...(gotVideo ? [[videoFile, '▶️ ดูวิดีโอ']] : []),
-    ...(gotAudio && !merged ? [[audio.value, '🎧 ฟังเสียง']] : []), // separate audio only when it isn't in the video
+    ...(gotVideo && gotAudio && !merged ? [[audio.value, '🎧 ฟังเสียง']] : []), // separate audio only when it isn't in the video
   ];
+  if (gotAudio && !gotVideo) dropAudio(audio.value); // no screen file: never a voice-only result (that is 🎙️'s)
   const problems = [video, audio].filter((r) => r.status === 'rejected').map((r) => (console.error(r.reason), `\n❌ ${errText(r.reason)}`));
   if (files.length && driveEnabled) await showCard(rec, { content: `⏫ **กำลังอัปโหลดขึ้น Google Drive...**`, components: [] });
-  const out = await deliver(files);
+  const out = await deliver(files, { guild: client.guilds.cache.get(g), room: paired?.channel ?? (rec.channelName ? { name: rec.channelName } : null), at: rec.liveAt ?? rec.firstFrameAt ?? rec.began });
   const ok = video.status === 'fulfilled';
   // the capture page polls this and opens the video on Drive (null = no link: the result is only in Discord)
   if (browser) rec.result = { url: gotVideo ? out.urls[0] ?? null : null };
   rlog(g, `${ok ? '✅' : '❌'} ส่งผลอัด${rec.what} ยาว ${length}: ${logFiles(files, out)}${problems.join('').replace(/\n/g, ' ')}`);
-  const head = ok && !gotVideo // nothing recorded on screen: only the room's audio
-    ? `✅ **อัดเสียงในห้องเสร็จแล้ว** · ยาว ${length} · ไม่ได้อัดภาพจอ`
+  const head = ok && !gotVideo ? '⚪ **ไม่ได้อัด** — ไม่มีภาพจอ' // nothing on screen: the room audio is dropped too
     : `${ok ? '✅' : '❌'} **อัด${rec.what}${ok ? 'เสร็จแล้ว' : 'ไม่สำเร็จ'}** · ยาว ${length}`;
   await showResult(rec, {
     content: head
@@ -705,7 +762,7 @@ async function finishVoice(rec, reason) {
     const file = await rec.stop(); // null when nobody spoke
     const files = file ? [[file, '🎧 ฟังเสียง']] : [];
     if (file && driveEnabled) await showCard(rec, { content: `⏫ **กำลังอัปโหลดขึ้น Google Drive...**`, components: [] });
-    const out = await deliver(files);
+    const out = await deliver(files, { guild: rec.channel.guild, room: rec.channel, at: rec.began });
     rlog(g, `✅ ส่งผลอัดเสียง ห้อง ${rec.channel.name} ยาว ${length}: ${file ? logFiles(files, out) : 'ไม่มีใครพูด'}`);
     await showResult(rec, {
       content: `✅ **อัดเสียงในห้อง ${rec.channel.name} เสร็จแล้ว** · ยาว ${length}${file ? '' : ' · ไม่มีใครพูด'}${out.note}${reason ? `\n-# ${reason}` : ''}`,
@@ -756,7 +813,7 @@ const ephemeral = (content, extra = {}) => ({ content, flags: MessageFlags.Ephem
 const linkRow = (rec) => new ActionRowBuilder().addComponents(linkButton('🎥 เปิดหน้าอัดจอ', pageUrl(rec)));
 const linkReply = (rec) => ephemeral([
   '🎥 กดปุ่มด้านล่าง → เลือกจอ → กด **แชร์** แค่นั้น',
-  `-# บอทจะเข้าห้อง **${rec.channelName}** มาอัดเสียงด้วย · ใช้คอมพิวเตอร์ (มือถืออัดได้แค่เสียง) · ลิงก์นี้ของคุณคนเดียว หมดอายุ ${ago(rec.began + 5 * 60000)}`,
+  `-# บอทจะเข้าห้อง **${rec.channelName}** มาอัดเสียงด้วย · ใช้คอมพิวเตอร์ (มือถืออัดจอไม่ได้) · ลิงก์นี้ของคุณคนเดียว หมดอายุ ${ago(rec.began + 5 * 60000)}`,
 ].join('\n'), { components: [linkRow(rec).addComponents(button('agent:install'))] });
 
 client.on('interactionCreate', async (i) => {
@@ -814,7 +871,7 @@ client.on('interactionCreate', async (i) => {
       const sess = screen.get(g)?.kind === 'session' ? screen.get(g) : null; // brings (or is about to bring) its own room audio
       if (voice.has(g) || startingVoice.has(g) || sess) {
         const v = voice.get(g), room = v?.channel.name ?? sess?.room.name ?? channel?.name; // a paired room audio's card is the screen's
-        return await i.reply(ephemeral(`บอทกำลังอัดเสียง${room ? `ในห้อง **${room}** ` : ' '}อยู่แล้ว ${v?.pairedTo?.card?.url ?? v?.card?.url ?? sess?.card?.url ?? ''}`));
+        return await i.reply(ephemeral(`บอทกำลัง${prepping(sess) ? 'เตรียมอัด' : 'อัดเสียง'}${room ? `ในห้อง **${room}** ` : ' '}อยู่แล้ว ${v?.pairedTo?.card?.url ?? v?.card?.url ?? sess?.card?.url ?? ''}`));
       }
       if (!channel) return await i.reply(ephemeral('🎙️ เข้าห้องเสียงก่อน แล้วกดอีกครั้ง'));
       if (!channel.joinable) return await i.reply(ephemeral(joinFail(channel.name)));
@@ -839,7 +896,7 @@ client.on('interactionCreate', async (i) => {
         return await i.reply(ephemeral(rec ? 'การอัดนี้จบไปแล้ว' : 'ไม่ได้อัดจออยู่'));
       }
       if (rec.owner !== i.user.id) return await i.reply(ephemeral(`ปุ่มนี้สำหรับ <@${rec.owner}> เท่านั้น อัดได้เฉพาะจอของตัวเอง`));
-      if (rec.state !== 'offered' || rec.stopping) return await i.reply(ephemeral('กำลังอัดอยู่แล้ว')); // live, or voice only (phone)
+      if (rec.state !== 'offered' || rec.stopping) return await i.reply(ephemeral('กำลังอัดอยู่แล้ว')); // live already
       return await i.reply(linkReply(rec));
     }
     if (cmd === 'screen' && sub !== 'stop') {
@@ -901,15 +958,17 @@ client.on('interactionCreate', async (i) => {
       }
       // the stop button on the recording's own message just updates it; anywhere else gets a pointer to it
       if (cmd === 'record' && rec.pairedTo && screen.get(g) === rec.pairedTo) { // room audio of a screen recording
-        await i.reply(ephemeral(`⏹️ กำลังหยุด (เสียงนี้อัดคู่กับจอ จึงหยุดทั้งคู่) ผลจะขึ้นที่ ${rec.pairedTo.card?.url ?? 'ข้อความของการอัดจอ'}`));
-        return await finishAny(rec.pairedTo, `หยุดโดย <@${i.user.id}>`);
+        await i.reply(ephemeral(prepping(rec.pairedTo) ? `✖️ ยกเลิกแล้ว ยังไม่ได้อัดอะไร ${rec.pairedTo.card?.url ?? ''}`.trimEnd()
+          : `⏹️ กำลังหยุด (เสียงนี้อัดคู่กับจอ จึงหยุดทั้งคู่) ผลจะขึ้นที่ ${rec.pairedTo.card?.url ?? 'ข้อความของการอัดจอ'}`));
+        return await finishAny(rec.pairedTo, `หยุดโดย <@${i.user.id}>`, { hand: true });
       }
       const offer = cmd === 'screen' && rec.kind !== 'session' && !live(rec) && !rec.paired; // a private link nobody opened
       if (offer) rec.offerNote ??= '✖️ ยกเลิกการอัดจอแล้ว'; // the link message says so, not "expired"
       if (i.isButton() && i.message.id === rec.card?.id) await i.deferUpdate();
       else if (offer) await i.reply(ephemeral('✖️ ยกเลิกการอัดจอแล้ว ลิงก์ที่ส่งไปใช้ไม่ได้แล้ว'));
-      else await i.reply(ephemeral(`⏹️ กำลังหยุด ผลจะขึ้นที่ ${rec.card?.url ?? 'ข้อความของการอัดนี้'}`));
-      return await (cmd === 'screen' ? finishAny : finishVoice)(rec, `หยุดโดย <@${i.user.id}>`);
+      else await i.reply(ephemeral(prepping(rec) ? `✖️ ยกเลิกแล้ว ยังไม่ได้อัดอะไร ${rec.card?.url ?? ''}`.trimEnd()
+        : `⏹️ กำลังหยุด ผลจะขึ้นที่ ${rec.card?.url ?? 'ข้อความของการอัดนี้'}`));
+      return await (cmd === 'screen' ? finishAny : finishVoice)(rec, `หยุดโดย <@${i.user.id}>`, { hand: true });
     }
   } catch (e) {
     console.error(e);
@@ -1048,8 +1107,8 @@ function onAgentChange(uid, online) {
 }
 
 // manual 🎥 with the presser's agent online (D11): a manual session on their machine, continuous (spec rule 7), not
-// tied to sharing. It records at once (the room audio, public card); a failed agent start keeps the audio and sends
-// them the private link instead, in this same ephemeral reply
+// tied to sharing. The bot joins the room at once (public card) and records from the moment the screen is live; a
+// failed agent start sends them the private link instead, in this same ephemeral reply (nothing records until it's opened)
 async function agentManual(i, room) {
   const g = i.guildId, guild = i.guild, uid = i.user.id;
   const busy = busyText(g, room); // a manual 🎙️ already holds the server's voice connection
@@ -1057,7 +1116,7 @@ async function agentManual(i, room) {
   const sess = newSession(guild, room, i.channel, uid, 'manual'); // reserved before any await
   rlog(g, `🖥️ ${who(uid)} กดอัดจอ (ตัวอัด) ห้อง ${room.name}`);
   const started = launch(sess, guild, uid, uid);
-  await i.reply(ephemeral('🔴 เริ่มอัดแล้ว บอทเข้าห้องอัดเสียง · ⏳ กำลังสั่งเครื่องของคุณให้อัดจอ...'));
+  await i.reply(ephemeral('⏳ กำลังสั่งเครื่องของคุณให้อัดจอ... · บอทเข้าห้องเตรียมอัด (เริ่มอัดพร้อมภาพจอ)'));
   const r = await started;
   await sess.cardQ;
   const url = sess.card?.url ?? '', on = screen.get(g) === sess && !sess.finished;
@@ -1068,14 +1127,12 @@ async function agentManual(i, room) {
   const why = { [ACK_ERROR.busy]: 'เครื่องของคุณกำลังอัดอยู่', [ACK_ERROR.declined]: 'เครื่องของคุณไม่ยอมให้อัดจอ', [ACK_ERROR.timeout]: 'เครื่องของคุณไม่ตอบ',
     [ACK_ERROR.display]: 'หาจอที่จะอัดไม่เจอ', [ACK_ERROR.offline]: 'ตัวอัดออฟไลน์' }[f.error]
     ?? `ตัวอัดเริ่มอัดไม่ได้${f.detail ? `: ${String(f.detail).slice(0, 300)}` : ''}`;
-  if (r.seg?.source === SESSION.link) { // the audio goes on; their screen through the link, only they see it
-    return i.editReply({
-      content: [`⚠️ ${why} — บอทยังอัดเสียงในห้องอยู่ ${url}`.trimEnd(), '🎥 กดปุ่มด้านล่าง → เลือกจอ → กด **แชร์** เพื่ออัดจอด้วย',
-        `-# ใช้คอมพิวเตอร์ (มือถืออัดได้แค่เสียง) · ลิงก์นี้ของคุณคนเดียว\n${stopHint}`].join('\n'),
-      components: [new ActionRowBuilder().addComponents(linkButton('🎥 เปิดหน้าอัดจอ', cardLink(r.seg.rec)), button('agent:install'))], ...quiet,
-    });
-  }
-  return i.editReply({ content: `⚠️ ${why} — อัดแค่เสียงในห้อง ${url}\n${stopHint}`, components: [], ...quiet });
+  // their screen through the link, only they see it; the session waits for it (launch ends one with no screen at all)
+  return i.editReply({
+    content: [`⚠️ ${why} — อัดผ่านลิงก์แทนได้ ${url}`.trimEnd(), '🎥 กดปุ่มด้านล่าง → เลือกจอ → กด **แชร์** เพื่อเริ่มอัด',
+      `-# บอทอยู่ในห้องแล้ว ยังไม่ได้อัดจนกว่าจะแชร์จอ · ใช้คอมพิวเตอร์ (มือถืออัดจอไม่ได้) · ลิงก์นี้ของคุณคนเดียว\n${stopHint}`].join('\n'),
+    components: [new ActionRowBuilder().addComponents(linkButton('🎥 เปิดหน้าอัดจอ', cardLink(r.seg.rec)), button('agent:install'))], ...quiet,
+  });
 }
 
 // --- share cards and sessions (press-to-start) ------------------------------------------------------
@@ -1185,7 +1242,7 @@ async function dropOrphanRoomCards(guild) {
   await updateSettings(guild.id, { roomCards: (getSettings(guild.id).roomCards ?? []).filter(([, m]) => !done.has(m)) });
 }
 
-const finishAny = (rec, reason) => (rec.kind === 'session' ? finishSession : finishScreen)(rec, reason);
+const finishAny = (rec, reason, opts) => (rec.kind === 'session' ? finishSession : finishScreen)(rec, reason, opts);
 
 // one recording per server (D2): why a 🔴 can't start a session for room ch now, or null
 function busyText(g, ch) {
@@ -1227,7 +1284,7 @@ async function pressRec(i, uid) {
 }
 
 // auto mode: uid shares in ch (card filters passed, nothing records in the server). The session starts as if 🔴 was
-// pressed for them, by them (the old auto flow): the bot joins and records the room at once, their screen comes from
+// pressed for them, by them (the old auto flow): the bot joins the room at once, their screen comes from
 // their agent, else the card link (browser mode) or the host Mac. A failed agent start skips them for auto (no loop)
 // and falls back like no agent
 async function autoStart(guild, ch, uid) {
@@ -1245,20 +1302,26 @@ async function autoStart(guild, ch, uid) {
   await launch(sess, guild, uid, uid, { auto: true });
 }
 
-// a new session records at once (the old flow): the bot joins the room while uid's screen starts, neither waits for
-// the other. A failed agent start keeps the room audio and falls back like no agent (startScreen); the session is
-// cancelled only when nothing records at all. -> startScreen's result, null when the session ended meanwhile
+// a new session prepares at once: the bot joins the room while uid's screen starts, neither waits for the other, and
+// the room audio starts recording when the screen is live (startAudio), not at the join. A failed agent start falls
+// back like no agent (startScreen); no screen at all ends the session with nothing recorded.
+// -> startScreen's result, null when the session ended meanwhile
 async function launch(sess, guild, uid, by, { auto = false } = {}) {
   const g = guild.id;
   sess.want = uid; // whose screen this session is for until one records (sessionEvent)
   const joined = joinSession(sess, guild).catch(console.error);
   const started = startScreen(sess, uid, by, { auto });
-  renderCard(sess, liveCardOf(sess)); // 🔴 at once, with "telling their machine..."
+  renderCard(sess, liveCardOf(sess)); // ⏳ at once, with "telling their machine..."
   const r = await started;
   if (!r || screen.get(g) !== sess || sess.finished) return null;
   // the join failed while this start was on its way: decided now (a join still on its way decides in joinSession)
   if (await joinFailed(sess, errorButtons(r.e))) return null;
-  if (!r.seg) renderCard(sess, liveCardOf(sess)); // the room audio goes on; the note says why there's no screen
+  if (!r.seg) { // no screen to wait for (no longer sharing, the Mac failed): nothing was recorded, the note says why
+    const vs = guild.voiceStates.cache.get(uid);
+    const left = sess.mode === 'share' && (vs?.channelId !== sess.room.id || !vs.streaming);
+    await finishSession(sess, left ? `<@${uid}> เลิกแชร์จอแล้ว` : undefined);
+    return null;
+  }
   sessionEvent(sess, guild); // they may have stopped sharing while it started
   await joined;
   return screen.get(g) === sess ? r : null;
@@ -1352,7 +1415,7 @@ async function startSegment(sess, uid, by, { agent = true, auto = false } = {}) 
     }
     seg.rec = new BrowserCapture(dirFor(g), { guildId: g, owner: uid, offerMs: 0, via: seg.source === SESSION.agent ? 'agent' : 'page' });
     wireSegment(sess, seg);
-    if (seg.source === SESSION.link) return accept(sess, seg); // the link goes on the card; the room is recorded meanwhile
+    if (seg.source === SESSION.link) return accept(sess, seg); // the link goes on the card; it records once opened
     renderCard(sess, liveCardOf(sess)); // ⏳ telling their machine
     const r = await deps.agents.start(uid, seg.rec, { // maxMs 0 = no limit; room/by are for display
       maxMs: sess.maxAt ? Math.max(0, sess.maxAt - Date.now()) : 0, room: sess.room.name, by: nameOf(client.guilds.cache.get(g), by), area: getSettings(g).area });
@@ -1378,6 +1441,7 @@ function accept(sess, seg) {
   sess.segments.push(seg);
   clearTimeout(sess.waitTimer);
   if (old) stopSeg(old);
+  if (live(seg.rec)) videoLive(sess, seg.rec.liveAt ?? seg.rec.firstFrameAt ?? Date.now()); // agent (acked) / host Mac: live already
   rlog(sess.guildId, `🎥 อัดจอของ ${who(seg.owner)} (${{ agent: 'ตัวอัด', link: 'ลิงก์เบราว์เซอร์', mac: 'เครื่องบอท' }[seg.source]})${old ? ` แทน ${who(old.owner)}` : ''}${seg.auto ? ' (อัตโนมัติ)' : ''}`);
   stateChanged(sess.guildId);
   renderCard(sess, liveCardOf(sess));
@@ -1418,19 +1482,10 @@ function wireSegment(sess, seg) {
       }
       // an agent start is logged once, by accept() (with the source); a card link is logged when its page starts
       if (seg.source === SESSION.link) rlog(g, `🔴 ${who(seg.owner)} เปิดลิงก์บนการ์ดและเริ่มอัดจอ capture ${rec.capId}`);
+      if (sess.cur === seg) videoLive(sess, rec.liveAt); // a card link (already accepted); an agent waits for accept()
       stateChanged(g);
       renderCard(sess, liveCardOf(sess));
     };
-    // the card link opened on a phone (U20): the room is already recorded, the card drops the link
-    if (seg.source === SESSION.link) {
-      rec.onVoiceOnly = async () => {
-        await sess.joining; // the bot may still be joining
-        if (!mine() || !sess.paired || voice.get(g) !== sess.paired) return { error: 'voice' };
-        stateChanged(g);
-        renderCard(sess, liveCardOf(sess));
-        return { paired: true };
-      };
-    }
   }
   rec.exited.then(() => {
     if (rec.stopping) return;
@@ -1455,10 +1510,11 @@ function segmentEnded(sess, seg, reason, kind) {
   }
   nextScreen(sess, kind === 'share' ? `${by} เลิกแชร์จอแล้ว` : reason, kind === 'share' ? `⏸️ ${by} หยุดแชร์แล้ว` : `${reason} (${by})`);
 }
-// no screen records now: a manual session or a room nobody else shares in ends (reason), else wait for a 🔴 ต่อ (pause)
+// no screen records now: a manual session, a room nobody else shares in or a session that never had a screen ends
+// (reason), else wait for a 🔴 ต่อ (pause; the room audio goes on)
 function nextScreen(sess, reason, pause) {
   const g = sess.guildId;
-  if (sess.mode === 'manual' || !sharing(sess).length) return void finishSession(sess, reason).catch(console.error);
+  if (sess.mode === 'manual' || !recorded(sess) || !sharing(sess).length) return void finishSession(sess, reason).catch(console.error);
   Object.assign(sess, { state: SESSION.waiting, pause, waitUntil: Date.now() + T.wait });
   armWait(sess, T.wait);
   rlog(g, `⏸️ รอ 🔴 อัดจอต่อ ห้อง ${sess.room.name}`);
@@ -1485,7 +1541,7 @@ function sessionEvent(sess, guild) {
     const vs = guild.voiceStates.cache.get(seg.owner);
     if (vs?.channelId !== sess.room.id || !vs.streaming) return segmentEnded(sess, seg, `<@${seg.owner}> เลิกแชร์จอแล้ว`, 'share');
   }
-  // started on the room audio but no screen got going (its start failed): when that sharer stops, as if it had ended
+  // started but no screen got going yet: when that sharer stops, as if it had ended (nothing recorded: the session ends)
   if (!seg && !sess.pending && sess.state === SESSION.starting && sess.mode === 'share' && sess.want) {
     const vs = guild.voiceStates.cache.get(sess.want);
     if (vs?.channelId !== sess.room.id || !vs.streaming) return nextScreen(sess, `<@${sess.want}> เลิกแชร์จอแล้ว`, `⏸️ <@${sess.want}> หยุดแชร์แล้ว`);
@@ -1565,12 +1621,13 @@ async function pressNext(i, sub, tag) {
   sessionEvent(sess, i.guild); // they may have stopped sharing while it started
 }
 
-// the room's audio for the whole session, joined as the session starts, in parallel with its first screen (rule 6)
+// the room's audio for the whole session: joined as the session starts, in parallel with its first screen (rule 6),
+// so it can start with no gap; it records only from the first live screen on (startAudio)
 async function joinSession(sess, guild) {
   const g = guild.id;
   let err;
   sess.joinState = 'joining'; // synchronously: the first card already says the bot is joining
-  sess.joining = joinRoom(guild, sess.room, sess.textChannel, sess, { by: sess.by, dir: sess.dir, onError: (e) => { err = e; } });
+  sess.joining = joinRoom(guild, sess.room, sess.textChannel, sess, { by: sess.by, dir: sess.dir, hold: true, onError: (e) => { err = e; } });
   const v = await sess.joining;
   if (!v) {
     sess.joinState = 'fail';
@@ -1581,6 +1638,7 @@ async function joinSession(sess, guild) {
   }
   sess.joinState = 'ok';
   if (screen.get(g) !== sess || sess.finished) return finishVoice(v, 'อัดจอหยุดไปแล้ว'); // ended while joining: silently
+  startAudio(sess); // the screen went live while the bot was joining: record from now on
   stateChanged(g);
   renderCard(sess, liveCardOf(sess)); // now says "with audio"
   sessionEvent(sess, guild); // the sharer may have stopped while it started
@@ -1604,8 +1662,9 @@ function noteJoin(sess) {
   return false;
 }
 
-// a session whose first screen or room audio never started: everything stops, nothing delivered, the card says why
-async function cancelSession(sess, text, components = []) {
+// a session that never recorded (no screen was ever live, or the bot couldn't join): everything stops, the bot leaves,
+// nothing is delivered or kept, the card says why. skip: who else isn't offered again until they re-share (⏹️: the room)
+async function cancelSession(sess, text, components = [], skip = []) {
   const g = sess.guildId;
   if (screen.get(g) !== sess || sess.finished) return;
   screen.delete(g);
@@ -1614,7 +1673,7 @@ async function cancelSession(sess, text, components = []) {
   clearTimeout(sess.waitTimer);
   // a start that couldn't get going (e.g. the bot can't join) isn't retried (auto) and its card isn't reposted at once:
   // a new share is a new chance
-  for (const u of new Set([sess.want, ...(sess.auto ? sess.segments.map((x) => x.owner) : [])])) skipSharer(client.guilds.cache.get(g), u);
+  for (const u of new Set([sess.want, ...(sess.auto ? sess.segments.map((x) => x.owner) : []), ...skip])) skipSharer(client.guilds.cache.get(g), u);
   for (const seg of [...sess.segments, sess.pending].filter((x) => x?.rec)) {
     stopSeg(seg).then(() => { if (seg.rec.kind === 'browser') seg.rec.result ??= { url: null }; });
   }
@@ -1624,19 +1683,24 @@ async function cancelSession(sess, text, components = []) {
     v.finished = true;
     clearTimeout(v.maxTimer);
     v.notice?.delete().catch(() => {});
-    v.stop().catch(console.error);
+    // leaves the room; a prepared recorder has no track (and a stray one isn't kept): its dir goes, empty or not
+    v.stop().catch(console.error).finally(() => rm(v.dir, { recursive: true, force: true })).catch(console.error);
   }
   stateChanged(g);
-  rlog(g, `⚪ ไม่ได้อัด ห้อง ${sess.room.name}: ${text}`);
+  rlog(g, `⚪ ไม่ได้อัด ห้อง ${sess.room.name}: ${text.replace(/\n/g, ' ')}`);
   await showCard(sess, { content: text, components });
   forgetCard(sess);
   setImmediate(() => { const guild = client.guilds.cache.get(g); if (guild) checkShares(guild); });
 }
 
-// end of a session: stop the screen and the room audio, compose one meeting file (rule 6), deliver it on the card
-async function finishSession(sess, reason) {
+// end of a session: stop the screen and the room audio, compose one meeting file (rule 6), deliver it on the card.
+// One that never had a live screen ends with nothing (cancelSession); hand: ⏹️ (every sharer of the room is skipped)
+async function finishSession(sess, reason, { hand = false } = {}) {
   const g = sess.guildId;
   if (screen.get(g) !== sess || sess.finished) return;
+  if (!recorded(sess)) {
+    return cancelSession(sess, `⚪ **ไม่ได้อัด** — ไม่มีภาพจอ${sess.notes}${reason ? `\n-# ${reason}` : ''}`, [], hand ? sharing(sess) : []);
+  }
   screen.delete(g);
   sess.finished = true; // queued live-card renders are dropped from here on
   clearTimeout(sess.maxTimer);
@@ -1661,11 +1725,6 @@ async function finishSession(sess, reason) {
   setImmediate(() => { const guild = client.guilds.cache.get(g); if (guild) checkShares(guild); });
   rlog(g, `⏹️ หยุดอัดห้อง ${sess.room.name}: ${reason ?? '-'}`);
   const audioP = v ? v.stop() : Promise.resolve(null);
-  if (!segs.length && !v) { // nothing ever recorded (stopped while starting)
-    audioP.catch(() => {});
-    await showCard(sess, { content: `⚪ **ยกเลิกการอัดจอ**${reason ? `\n-# ${reason}` : ''}`, components: [] });
-    return forgetCard(sess);
-  }
   await showCard(sess, { content: '⏳ **กำลังบันทึกไฟล์...**', components: [] });
   const [audio, ...videos] = await Promise.allSettled([audioP, ...segs.map((s) => s.done)]);
   const audioFile = audio.status === 'fulfilled' ? audio.value : null;
@@ -1680,8 +1739,9 @@ async function finishSession(sess, reason) {
       const r = await deps.composeMeeting({
         segments: got.map(({ seg, file }) => ({ file, start: seg.rec.liveAt ?? seg.rec.firstFrameAt ?? seg.began })),
         audio: audioFile,
-        // no audio file (nobody spoke): the origin is the earliest video, or compose would trim the start of the first segment
-        audioStart: audioFile ? v?.startedAt || sess.began : Math.min(sess.began, ...got.map(({ seg }) => seg.rec.liveAt ?? seg.rec.firstFrameAt ?? seg.began)),
+        // the origin is the first live video (the audio starts there too; no audio file: the earliest video), never the
+        // prepare time before it, which would be a black head
+        audioStart: audioFile ? v?.startedAt || sess.videoAt : Math.min(...got.map(({ seg }) => seg.rec.liveAt ?? seg.rec.firstFrameAt ?? seg.began)),
         end, dir: sess.dir,
       });
       meeting = r.file;
@@ -1696,21 +1756,21 @@ async function finishSession(sess, reason) {
   if (!meeting && got.length > 3) note += `\n⚠️ มีวิดีโอ ${got.length} ช่วง ส่งได้ 3 ช่วงแรก ที่เหลืออยู่ในเครื่องบอท`;
   const files = meeting ? [[meeting, '▶️ ดูวิดีโอ']] : [
     ...vids.map(({ file }, k) => [file, vids.length > 1 ? `▶️ วิดีโอ ${k + 1}` : '▶️ ดูวิดีโอ']),
-    ...(audioFile ? [[audioFile, '🎧 ฟังเสียง']] : []),
+    ...(audioFile && got.length ? [[audioFile, '🎧 ฟังเสียง']] : []), // never the room audio alone (that is 🎙️'s)
   ];
+  if (audioFile && !got.length) dropAudio(audioFile);
   const problems = [...(audio.status === 'rejected' ? [audio.reason] : []), ...segs.filter((s) => s.error).map((s) => s.error)]
     .map((e) => (console.error(e), `\n❌ ${errText(e)}`));
   if (files.length && driveEnabled) await showCard(sess, { content: '⏫ **กำลังอัปโหลดขึ้น Google Drive...**', components: [] });
-  const out = await deliver(files);
+  const out = await deliver(files, { guild: sess.room.guild, room: sess.room, at: sess.videoAt ?? sess.began });
   // every capture page of the session opens the meeting video on Drive (null = no link: the result is only in Discord)
   const url = got.length ? out.urls[0] ?? null : null;
   for (const { rec } of segs) if (rec.kind === 'browser') rec.result = { url };
-  const length = duration(end - sess.began);
+  const length = duration(end - (sess.videoAt ?? sess.began)); // from the first video: the prepare time isn't recorded
   const owners = [...new Set(got.map(({ seg }) => `<@${seg.owner}>`))];
   rlog(g, `${files.length || !problems.length ? '✅' : '❌'} ส่งผลอัดห้อง ${sess.room.name} ยาว ${length}: ${logFiles(files, out)}${problems.join('').replace(/\n/g, ' ')}`);
   const head = got.length ? `✅ **อัดจอเสร็จแล้ว** · ยาว ${length} · จอของ ${owners.join(' → ')}`
-    : audioFile ? `✅ **อัดเสียงในห้องเสร็จแล้ว** · ยาว ${length} · ไม่ได้อัดภาพจอ`
-      : `${problems.length ? '❌' : '✅'} **อัดเสร็จแล้ว** · ยาว ${length} · ไม่มีภาพจอและไม่มีใครพูด`;
+    : `❌ **อัดจอไม่สำเร็จ** · ยาว ${length} · ไม่ได้ไฟล์วิดีโอ`; // the screens failed: their room audio isn't sent alone
   await showResult(sess, {
     content: head + `${problems.join('')}${segs.map((s) => s.rec.notes ?? '').join('')}${sess.notes}${note}${out.note}${reason ? `\n-# ${reason}` : ''}`,
     components: out.components.slice(0, 5), files: out.files,
@@ -1749,68 +1809,28 @@ function offerBrowser(guild, owner, textChannel, voiceChannel) {
     if (room && !rec.channelName) rec.channelName = room.name;
     pairVoice(rec, guild, room, textChannel).catch(console.error);
   };
-  rec.onVoiceOnly = () => voiceOnly(rec, guild); // the page can't capture (phone, U20)
   trackScreen(g, rec);
   return rec;
 }
 
-// U20: the owner opened their private link on a device that can't capture, so the bot records the room's audio
-// instead. Contract (BrowserCapture.voiceOnly): { paired:true } the room is already recorded · { paired:false } a
-// voice recording was started here · { error:'novoice' } owner not in a voice room · { error:'voice' } couldn't
-// join. On an error the offer stays open (the page tells them to use a computer), so it's never finished here then
-async function voiceOnly(rec, guild) {
-  const g = guild.id, owner = rec.owner;
-  if (screen.get(g) !== rec) return { error: 'voice' }; // stopped meanwhile
-  const done = async (note) => { // the private offer ends silently; its link message says why
-    rec.offerNote = note;
-    if (screen.get(g) === rec) await finishScreen(rec, '📱 เปิดลิงก์จากอุปกรณ์ที่อัดจอไม่ได้ อัดแค่เสียง');
-  };
-  if (voice.has(g) || startingVoice.has(g)) {
-    await done('📱 อุปกรณ์นี้อัดจอไม่ได้ — บอทอัดเสียงในห้องอยู่แล้ว');
-    return { paired: true };
-  }
-  const room = guild.members.cache.get(owner)?.voice?.channel;
-  if (!room) return { error: 'novoice' };
-  if (!room.joinable) { rlog(g, joinFail(room.name)); return { error: 'voice' }; }
-  startingVoice.add(g); // before the first await, like record:start
-  let v;
-  try {
-    v = Object.assign(new deps.VoiceRecorder(room, dirFor(g)), {
-      textChannel: rec.textChannel, by: owner, note: `-# <@${owner}> เปิดลิงก์อัดจอจากมือถือ เลยอัดได้แค่เสียง`,
-    });
-    await v.start();
-  } catch (e) {
-    console.error(e);
-    rlog(g, isAbort(e) ? joinFail(room.name) : `❌ บอทเข้าห้องเสียง ${room.name} ไม่ได้: ${errText(e)}`);
-    return { error: 'voice' };
-  } finally {
-    startingVoice.delete(g);
-  }
-  trackVoice(g, v);
-  await renderCard(v, liveCardOf(v)); // public card in the channel where 🎥 was pressed
-  await done(`📱 อุปกรณ์นี้อัดจอไม่ได้ — บอทอัดเสียงในห้องให้แทนแล้ว ${v.card?.url ?? ''}`.trimEnd());
-  return { paired: false };
-}
-
 // the bot joins room ch to record it alongside a screen recording (pairWith: a manual screen recording or a
-// session); its file is delivered on that card. Resolves the recorder, or null when it couldn't join
-// (onError(e); by default the error is posted in textChannel)
-async function joinRoom(guild, ch, textChannel, pairWith, { by, dir, onError } = {}) {
+// session); its file is delivered on that card. hold: joined but silent until begin() (a session before its first
+// screen). Resolves the recorder, or null when it couldn't join (onError(e); by default the error is posted in textChannel)
+async function joinRoom(guild, ch, textChannel, pairWith, { by, dir, onError, hold = false } = {}) {
   const g = guild.id;
   startingVoice.add(g);
   try {
     const rec = Object.assign(new deps.VoiceRecorder(ch, dir ?? dirFor(g)), { textChannel, ...(by ? { by } : {}) });
-    await rec.start();
+    await rec.start({ record: !hold });
     pairWith.paired = rec; // link both ways before tracking, or a check in between sees an orphan
     rec.pairedTo = pairWith;
     trackVoice(g, rec);
     await pairWith.cardQ; // the card (posted meanwhile) decides whether the room needs its own notice
     // people being recorded must be told in the room itself when the card lives elsewhere
-    if (pairWith.card?.channelId !== ch.id) {
-      rec.notice = await ch.send({
-        content: '🔴 **ห้องนี้กำลังถูกอัดเสียง**',
-        components: [new ActionRowBuilder().addComponents(stopBtn('record:stop', rec.began))],
-      }).catch(console.error);
+    if (pairWith.card?.channelId !== ch.id && !rec.finished) {
+      const was = rec.recording;
+      rec.notice = await ch.send(noticeOf(rec)).catch(console.error);
+      if (rec.recording !== was) rec.notice?.edit(noticeOf(rec)).catch(() => {}); // the screen went live meanwhile
     }
     return rec;
   } catch (e) {

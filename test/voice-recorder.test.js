@@ -66,3 +66,26 @@ test('a requested stop is not reported as gone', async () => {
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(gone, 0);
 });
+
+// a session's room audio: joined (start({record:false})) but silent until begin(at), whose clock is the video's
+test('begin(at): nothing subscribed before it; sets startedAt and listens once; never after a stop', async () => {
+  const speaking = Object.assign(new EventEmitter(), { users: new Map() });
+  const rec = new VoiceRecorder({}, 'x');
+  rec.connection = Object.assign(fakeConnection(), { receiver: { speaking } });
+  assert.equal(rec.recording, false);
+  assert.equal(speaking.listenerCount('start'), 0, 'joined but not listening');
+  rec.begin(1234);
+  assert.equal(rec.recording, true);
+  assert.equal(rec.startedAt, 1234);
+  assert.equal(speaking.listenerCount('start'), 1);
+  rec.begin(9999); // idempotent: the clock stays the first video's
+  assert.equal(rec.startedAt, 1234);
+  assert.equal(speaking.listenerCount('start'), 1);
+  assert.equal(await rec.stop(), null, 'nobody spoke: no voice.mp3');
+
+  const late = new VoiceRecorder({}, 'x');
+  late.connection = Object.assign(fakeConnection(), { receiver: { speaking: Object.assign(new EventEmitter(), { users: new Map() }) } });
+  await late.stop();
+  late.begin();
+  assert.equal(late.recording, false, 'a stopped recorder never begins');
+});

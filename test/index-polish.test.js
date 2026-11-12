@@ -51,7 +51,7 @@ describe('panel (D12 and session states)', () => {
     assert.match(content(p), new RegExp(`🟢 ตัวอัดออนไลน์: <@${s.b.id}>`));
   });
 
-  test('(old flow) a manual 🖥️ is public at once: the panel shows the room audio and the pending screen, then live', async () => {
+  test('a manual 🖥️ is public at once: the panel and nickname show prepare (nothing recorded), then live', async () => {
     const s = await cardScene();
     s.guild.members.me.nickname = 'Keep';
     agents.setOnline(s.member.id);
@@ -59,9 +59,12 @@ describe('panel (D12 and session states)', () => {
     const i = fakeInteraction({ guild: s.guild, member: s.member, channel: s.text, customId: 'screen:me' });
     const done = fire('interactionCreate', i);
     await waitFor(() => agents.pending.length === 1, 'machine told');
-    await waitFor(() => voice.has(s.guild.id), 'room audio at once');
-    assert.match(content(panelOf(s)), new RegExp(`🔴 อัดเสียงในห้อง \\*\\*Meeting\\*\\* · 🟡 รอเริ่มอัดจอของ <@${s.member.id}>`));
-    await waitFor(() => nick(s) === 'Alice - 🔴 กำลังอัดเสียง', 'tagged as recording audio');
+    await waitFor(() => voice.has(s.guild.id), 'joined at once');
+    const p = panelOf(s);
+    assert.match(content(p), new RegExp(`⏳ เตรียมอัดในห้อง \\*\\*Meeting\\*\\* · รอภาพจอของ <@${s.member.id}> \\(ยังไม่ได้อัด\\)`));
+    assert.doesNotMatch(content(p), /🔴/);
+    assert.deepEqual(parts(p).filter((c) => c.custom_id === 'screen:stop').map((c) => [c.label, c.style]), [['✖️ ยกเลิกอัดจอ', 2]], 'a grey cancel');
+    await waitFor(() => nick(s) === 'Alice - ⏳ เตรียมอัด', 'tagged as preparing');
     agents.ack('ok');
     await done;
     const sess = await waitFor(() => screen.get(s.guild.id)?.cur && screen.get(s.guild.id), 'live');
@@ -82,7 +85,7 @@ describe('panel (D12 and session states)', () => {
     const pressing = press(s, `screen:rec:${s.member.id}`, { message: card });
     await waitFor(() => agents.pending.length === 1, 'asked');
     let p = panelOf(s);
-    assert.match(content(p), /🟡 รอเริ่มอัดจอของ/);
+    assert.match(content(p), /⏳ เตรียมอัดในห้อง/);
     agents.ack('ok');
     await pressing;
     const sess = await waitFor(() => screen.get(s.guild.id)?.cur && screen.get(s.guild.id), 'live');

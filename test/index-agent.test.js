@@ -298,7 +298,7 @@ describe('agent online/offline', () => {
 });
 
 describe('manual 🎥 อัดจอฉัน with an agent (case 4)', () => {
-  test('(old flow) records at once: ephemeral 🔴 + ⏳, the public card and the room join before the ack; live → card; ⏹️ → one meeting file', async () => {
+  test('prepares at once: ephemeral ⏳, the public prepare card and the room join before the ack (nothing recorded); live → audio starts; ⏹️ → one meeting file', async () => {
     const s = await manualScene();
     agents.setOnline(s.member.id);
     agents.startMode = 'hold';
@@ -308,15 +308,18 @@ describe('manual 🎥 อัดจอฉัน with an agent (case 4)', () => {
     assert.equal(sess.kind, 'session');
     assert.equal(sess.mode, 'manual');
     await waitFor(() => agents.pending.length === 1, 'machine told');
-    assert.match(content(i.replies[0]), /^🔴 เริ่มอัดแล้ว บอทเข้าห้องอัดเสียง · ⏳ กำลังสั่งเครื่องของคุณ/);
+    assert.equal(content(i.replies[0]), '⏳ กำลังสั่งเครื่องของคุณให้อัดจอ... · บอทเข้าห้องเตรียมอัด (เริ่มอัดพร้อมภาพจอ)');
     assert.ok(isEphemeral(i.replies[0]));
     await waitFor(() => sess.paired && voice.get(g) === sess.paired, 'joined before the ack');
     await sess.cardQ;
-    assert.equal(s.text.sent.length, 1, 'the public card at once: the room is recorded');
-    assert.match(content(lastOf(sess.card)), /^🔴 \*\*กำลังอัดในห้อง Meeting\*\*/);
+    assert.equal(s.text.sent.length, 1, 'the public card at once: the bot is in the room');
+    assert.match(content(lastOf(sess.card)), /^⏳ \*\*เตรียมอัดในห้อง Meeting\*\*/);
+    assert.equal(sess.paired.recording, false, 'nothing recorded before the screen');
     agents.ack('ok');
     await done;
     await live(s);
+    assert.equal(sess.paired.recording, true);
+    assert.equal(sess.paired.startedAt, sess.cur.rec.liveAt, 'the audio starts at the agent\'s live time');
     assert.equal(agents.calls.length, 1);
     assert.equal(agents.calls[0].userId, s.member.id, 'only the presser\'s machine');
     assert.equal(agents.calls[0].capture.via, 'agent');
@@ -333,7 +336,7 @@ describe('manual 🎥 อัดจอฉัน with an agent (case 4)', () => {
     assert.match(content(out), /^✅ \*\*อัดจอเสร็จแล้ว\*\*/);
     assert.deepEqual(labels(out), ['▶️ ดูวิดีโอ', '📁 ไฟล์ทั้งหมด']);
     assert.equal(composed.calls.length, 1);
-    assert.deepEqual(uploads.map((u) => u.replace(/^.*-/, '')), ['meeting.mp4']);
+    assert.deepEqual(uploads.map((u) => u.replace(/^\d{4}-\d\d-\d\d \d\d\.\d\d /, '')), ['Meeting.mp4']);
     assert.ok(agents.stops.some((x) => x.userId === s.member.id));
     assert.ok(FakeVoiceRecorder.instances[0].stopped, 'bot left');
   });
@@ -474,7 +477,7 @@ describe('manual 🎥 อัดจอฉัน with an agent (case 4)', () => {
     await resultOf(s, sess);
   });
 
-  test('S3: the presser leaves while the machine is told: ends with the room audio delivered, their reply says it ended', async () => {
+  test('S3: the presser leaves while the machine is told: ends with nothing recorded, their reply says it ended', async () => {
     const s = await manualScene();
     agents.setOnline(s.member.id);
     agents.startMode = 'hold';
@@ -487,7 +490,9 @@ describe('manual 🎥 อัดจอฉัน with an agent (case 4)', () => {
     agents.ack('ok');
     await done;
     const out = await resultOf(s, sess);
-    assert.match(content(out), /^✅ \*\*อัดเสียงในห้องเสร็จแล้ว\*\*/);
+    assert.match(content(out), /^⚪ \*\*ไม่ได้อัด\*\* — ไม่มีภาพจอ/);
+    assert.equal(uploads.length + composed.calls.length, 0, 'no voice.mp3, nothing composed');
+    assert.ok(FakeVoiceRecorder.instances.every((v) => v.stopped), 'the bot left');
     assert.match(content(lastOf(i)), /จบแล้ว/);
   });
 
@@ -514,16 +519,17 @@ describe('manual 🎥 อัดจอฉัน with an agent (case 4)', () => {
   });
 });
 
-describe('manual 🖥️ failures keep the room audio and fall back to the private link', () => {
+describe('manual 🖥️ failures fall back to the private link (nothing recorded until it is opened)', () => {
   for (const [mode, text] of [['busy', 'เครื่องของคุณกำลังอัดอยู่'], ['declined', 'เครื่องของคุณไม่ยอมให้อัดจอ'], ['timeout', 'เครื่องของคุณไม่ตอบ'], ['ffmpeg', 'ตัวอัดเริ่มอัดไม่ได้']]) {
-    test(`agent ${mode}: the audio keeps recording, the ephemeral reply has the private link + 📥, a note on the public card`, async () => {
+    test(`agent ${mode}: still preparing, the ephemeral reply has the private link + 📥, a note on the public card`, async () => {
       const s = await manualScene();
       agents.setOnline(s.member.id);
       agents.startMode = mode;
       const i = await press(s, 'screen:me');
       const e = lastOf(i);
       assert.ok(content(e).includes(text), content(e));
-      assert.match(content(e), /บอทยังอัดเสียงในห้องอยู่/);
+      assert.match(content(e), /อัดผ่านลิงก์แทนได้/);
+      assert.match(content(e), /ยังไม่ได้อัดจนกว่าจะแชร์จอ/);
       const link = parts(e);
       assert.deepEqual(link.map((c) => c.custom_id ?? 'url'), ['url', 'agent:install']);
       assert.match(link[0].url, /^http:\/\/localhost:1\/capture\//);

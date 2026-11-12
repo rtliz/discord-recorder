@@ -47,7 +47,7 @@ const oneResult = async (s, name) => {
   assert.ok(l.some((x) => x.includes('ดูวิดีโอ')) && !l.some((x) => x.includes('ฟังเสียง')), `${name}: one video with the audio in it (${l})`);
   assert.deepEqual([FakeScreenRecorder.instances, FakeVoiceRecorder.instances].map((a) => a.map((x) => x.stopped)), [[true], [true]], `${name}: stopped`);
   assert.equal(uploads.length, 1);
-  assert.match(uploads[0], /-(with-audio|meeting)\.\w+$/);
+  assert.match(uploads[0], /^\d{4}-\d\d-\d\d \d\d\.\d\d .+\.\w+$/);
   return r[0];
 };
 
@@ -106,23 +106,18 @@ describe('one host screen across servers', () => {
     assert.ok(screen.has(a.guild.id));
   });
 
-  test('A\'s Mac fails to start (no permission): the room audio goes on with the error note; B can start straight away', async () => {
+  test('A\'s Mac fails to start (no permission): nothing recorded, A ends at once with the error note; B can start straight away', async () => {
     const a = await autoScene();
     const b = await autoScene();
     FakeScreenRecorder.startHook = () => { throw Object.assign(new Error('no permission'), { code: 'SCREEN_PERMISSION' }); };
     share(a);
     await pressRec(bot, a);
     const card = a.room.sent[0];
-    await waitFor(() => /อัดจอเครื่องบอทไม่ได้: no permission/.test(content(lastOf(card))), 'the error on A\'s card');
+    await waitFor(() => !screen.has(a.guild.id) && /^⚪ \*\*ไม่ได้อัด\*\* — ไม่มีภาพจอ\n.*อัดจอเครื่องบอทไม่ได้: no permission/.test(content(lastOf(card))), 'A ended, the error on its card');
     assert.equal(a.room.sent.length, 1, 'one message in A');
-    const sess = screen.get(a.guild.id);
-    assert.equal(sess?.kind, 'session', 'not cancelled: the room is recorded');
-    await waitFor(() => sess.paired, 'room audio');
-    assert.equal(sess.cur, null);
+    await waitFor(() => FakeVoiceRecorder.instances.every((v) => v.stopped && !v.recording), 'the bot left without recording');
     FakeScreenRecorder.startHook = null;
     await autoRec(b);
-    share(a, false); // the sharer stops: A ends with the room audio
-    await waitFor(() => !screen.has(a.guild.id) && /^✅ \*\*อัดเสียงในห้องเสร็จแล้ว/.test(content(lastOf(card))), 'A audio result');
   });
 
   test('the same sharer pressing 🖥️ twice quickly starts one ffmpeg', async () => {

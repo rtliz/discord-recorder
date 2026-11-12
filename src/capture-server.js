@@ -60,7 +60,7 @@ export function loadAgentAssets(dir = fileURLToPath(new URL('./agent/', import.m
   return { files, scripts, manifest: Buffer.from(JSON.stringify(manifest, null, 2)) };
 }
 
-// per capture token bucket (20, +1/s) shared by chunk, status, result and voice
+// per capture token bucket (20, +1/s) shared by chunk, status and result
 const buckets = new WeakMap();
 const takeToken = (rec) => {
   const now = Date.now(), b = buckets.get(rec) ?? { n: 20, t: now };
@@ -142,11 +142,11 @@ export function startCaptureServer(port, { assets = publicUrl ? loadAssets() : n
       return send(res, 200, assets.html, { ...PAGE, 'Content-Type': 'text/html; charset=utf-8' });
     }
 
-    const m = /^\/api\/capture\/([^/]+)\/(start|voice|status|stop|result|chunk\/([^/]+))$/.exec(path);
+    const m = /^\/api\/capture\/([^/]+)\/(start|status|stop|result|chunk\/([^/]+))$/.exec(path);
     if (!m) return send(res, 404, '');
     const [, capId, action, seqText] = m;
     const route = action.startsWith('chunk/') ? 'chunk' : action;
-    if (!allow({ start: 'POST', voice: 'POST', stop: 'POST', status: 'GET', result: 'GET', chunk: 'PUT' }[route])) return;
+    if (!allow({ start: 'POST', stop: 'POST', status: 'GET', result: 'GET', chunk: 'PUT' }[route])) return;
     const upload = route === 'chunk';
     // POST/PUT from a browser must come from our own page
     if (method !== 'GET' && req.headers.origin !== undefined && req.headers.origin !== origin) return json(res, 403, { error: 'origin' }, true);
@@ -158,14 +158,6 @@ export function startCaptureServer(port, { assets = publicUrl ? loadAssets() : n
       if (typeof body.token !== 'string' || tokenCapId(body.token) !== capId) return json(res, 400, { error: 'token' });
       if (typeof body.mime !== 'string' || body.mime.length > 100 || !MIME.test(body.mime)) return json(res, 400, { error: 'mime' });
       return json(res, 200, rec.claim(body.token, body.mime));
-    }
-
-    // a phone can't capture: the bot records the voice room instead (BrowserCapture.voiceOnly)
-    if (route === 'voice') {
-      if (!takeToken(rec)) return json(res, 429, { error: 'slow down' }, true);
-      const body = await readJson(req);
-      if (typeof body.token !== 'string' || tokenCapId(body.token) !== capId) return json(res, 400, { error: 'token' });
-      return json(res, 200, await rec.voiceOnly(body.token));
     }
 
     // after stopping, the page waits here for the delivered file (Drive link) to open it

@@ -22,9 +22,11 @@ export class VoiceRecorder {
     this.dir = dir;
     this.tracks = new Map(); // userId -> { file, out, written, active }
     this.startedAt = 0;
+    this.recording = false;
   }
 
-  async start() {
+  // joins the room; record false: sit in it silently until begin() (a session's room audio starts with its first video)
+  async start({ record = true } = {}) {
     await mkdir(this.dir, { recursive: true });
     this.connection = joinVoiceChannel({
       channelId: this.channel.id,
@@ -38,9 +40,19 @@ export class VoiceRecorder {
       this.connection.destroy(); // don't leave a half-open connection for the next join to reuse
       throw e;
     }
-    this.startedAt = Date.now();
-    this.connection.receiver.speaking.on('start', (id) => this.#listen(id));
     this.watch(this.connection);
+    if (record) this.begin();
+  }
+
+  // starts recording on the joined connection; at = the recording clock's zero (every track is padded from it).
+  // Nothing is subscribed before this, so nobody is recorded while the bot only waits in the room
+  begin(at = Date.now()) {
+    if (this.recording || this.stopping || !this.connection) return;
+    this.recording = true;
+    this.startedAt = at;
+    const { speaking } = this.connection.receiver;
+    speaking.on('start', (id) => this.#listen(id));
+    for (const id of speaking.users?.keys() ?? []) this.#listen(id); // already talking: no wait for their next burst
   }
 
   // kicked, moved away for good, or the network gone: tell the owner (onGone) instead of recording silence.

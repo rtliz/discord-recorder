@@ -153,40 +153,20 @@ describe('capture page in headless Chrome', { skip }, () => {
     }
   });
 
-  // U20: no getDisplayMedia -> the page asks the bot (POST /voice) to record the room instead
-  const U20 = [
-    ['no onVoiceOnly (fallback failed)', undefined, '📱 อุปกรณ์นี้อัดจอไม่ได้ ใช้คอมพิวเตอร์แทน', 'offered'],
-    ['manual: bot started a voice recording', async () => ({ paired: false }), '📱 อุปกรณ์นี้อัดจอไม่ได้ — บอทอัดเสียงในห้องให้แทนแล้ว ดูผลใน Discord', 'voice'],
-    ['auto: room already recorded', () => ({ paired: true }), '📱 อุปกรณ์นี้อัดจอไม่ได้ — บอทอัดเสียงในห้องอยู่แล้ว ปิดหน้านี้ได้', 'voice'],
-    ['owner not in voice', () => ({ error: 'novoice' }), '📱 อุปกรณ์นี้อัดจอไม่ได้ และคุณไม่ได้อยู่ในห้องเสียง', 'offered'],
-  ];
-  for (const [name, cb, want, state] of U20) {
-    test(`no getDisplayMedia -> /voice -> U20 text: ${name}`, async () => {
+  // U20: a phone can't capture: the page says so and records nothing (no /voice call, the link stays unclaimed)
+  const NOCAP = '📱 อุปกรณ์นี้อัดจอไม่ได้ — เปิดลิงก์นี้จากคอมพิวเตอร์ หรือกด 🎙️ อัดเสียง ใน Discord ถ้าจะอัดแค่เสียง';
+  for (const [name, mode] of [['no getDisplayMedia', 'none'], ['getDisplayMedia rejecting NotSupportedError (mobile)', 'unsupported']]) {
+    test(`${name} -> the phone text, nothing recorded, the link still works from a computer`, async () => {
       const rec = fresh();
-      let calls = 0;
-      if (cb) rec.onVoiceOnly = (r) => { calls++; assert.equal(r, rec); return cb(r); };
-      const page = await open(rec.link(), 'none');
-      await until(async () => (await text(page, '#msg')) === want, 5000, `U20 text "${want}"`);
+      const page = await open(rec.link(), mode);
+      await until(async () => (await text(page, '#msg')) === NOCAP, 5000, 'phone text');
       assert.equal(await visible(page, '#start'), false);
-      assert.equal(calls, cb ? 1 : 0);
-      assert.equal(rec.voiceTried, true);
-      assert.equal(rec.state, state);
+      assert.equal(rec.state, 'offered', 'unclaimed: a computer can still open it');
+      assert.equal(rec.lived, 0);
       rec.exit('test'); await rec.stop();
       await page.close();
     });
   }
-
-  test('getDisplayMedia rejecting NotSupportedError (mobile) -> same voice fallback as having none', async () => {
-    const rec = fresh();
-    let calls = 0;
-    rec.onVoiceOnly = () => { calls++; return { paired: false }; };
-    const page = await open(rec.link(), 'unsupported');
-    await until(async () => (await text(page, '#msg')) === '📱 อุปกรณ์นี้อัดจอไม่ได้ — บอทอัดเสียงในห้องให้แทนแล้ว ดูผลใน Discord', 5000, 'U20 text');
-    assert.equal(await visible(page, '#start'), false);
-    assert.equal(calls, 1);
-    rec.exit('test'); await rec.stop();
-    await page.close();
-  });
 
   test('second tab on the same link gets the "already opened" text', async () => {
     const rec = fresh();

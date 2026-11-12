@@ -117,31 +117,6 @@ export class BrowserCapture {
     return { session, chunkMs: 3000, videoBps: 2_000_000 };
   }
 
-  // the page can't capture (phone): the bot records the voice room instead. Single use.
-  // onVoiceOnly(rec), set by index.js, sync or async, returns/resolves:
-  //   { paired: true }      the room is already being recorded (auto offer) -> 200 { ok, paired: true }
-  //   { paired: false }     index.js started a voice recording (manual)     -> 200 { ok, paired: false }
-  //   { error: 'novoice' }  the owner is not in a voice room                 -> 409 { error: 'novoice' }
-  // unset, a throw, or anything else -> 409 { error: 'voice' }. On any failure the offer goes back to
-  // 'offered' (same expiry), so the link still works from a computer, which is what the page then suggests.
-  async voiceOnly(token) {
-    if (checkToken(token) !== this) throw fail(410, { stop: true });
-    if (this.state !== 'offered' || this.stopRequested || this.voiceTried) throw fail(410, { stop: true });
-    // check-and-set with no await in between: a second call or a claim during the callback gets 410
-    Object.assign(this, { voiceTried: true, state: 'voice' });
-    let r;
-    try { r = await this.onVoiceOnly?.(this); } catch (e) { console.error(e); }
-    if (r && typeof r.paired === 'boolean' && !r.error) {
-      clearTimeout(this.offerTimer); // no expiry now: index.js ends it (manual at once, auto when the share ends)
-      return { ok: true, paired: r.paired };
-    }
-    if (this.state === 'voice') { // not stopped meanwhile: offered again
-      this.state = 'offered';
-      if (this.offerEnd && Date.now() >= this.offerEnd) this.exit('ไม่มีใครกดอัดจอภายใน 5 นาที'); // expired during the callback
-    }
-    throw fail(409, { error: r?.error === 'novoice' ? 'novoice' : 'voice' });
-  }
-
   authed(bearer) {
     return Boolean(this.session && bearer) && timingSafeEqual(sha(bearer), this.session);
   }
