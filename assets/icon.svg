@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5865F2"/>
+      <stop offset="1" stop-color="#2B2F8F"/>
+    </linearGradient>
+    <radialGradient id="rec" cx="0.4" cy="0.35" r="0.7">
+      <stop offset="0" stop-color="#FF7A7A"/>
+      <stop offset="1" stop-color="#E5243B"/>
+    </radialGradient>
+  </defs>
+  <!-- Square bg; Discord crops avatars to a circle, so content stays inside r≈180 -->
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <!-- Screen -->
+  <rect x="116" y="146" width="280" height="190" rx="28" fill="#1E2160" fill-opacity="0.55" stroke="#FFFFFF" stroke-width="22"/>
+  <path d="M256 347 V376 M200 382 H312" stroke="#FFFFFF" stroke-width="22" stroke-linecap="round"/>
+  <!-- Voice bars -->
+  <g stroke="#FFFFFF" stroke-width="14" stroke-linecap="round">
+    <path d="M166 223 V259 M346 223 V259"/>
+    <path d="M192 208 V274 M320 208 V274"/>
+  </g>
+  <!-- REC dot -->
+  <circle cx="256" cy="241" r="50" fill="#E5243B" fill-opacity="0.25"/>
+  <circle cx="256" cy="241" r="36" fill="url(#rec)"/>
+</svg>
