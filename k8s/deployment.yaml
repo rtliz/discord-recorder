@@ -13,7 +13,7 @@ data:
   ALLOWED_USER_IDS: ""
   ALLOWED_GUILD_IDS: ""                       # server ที่ให้ใช้บอท คั่นด้วย , (ว่าง = ทุก server ที่เชิญ)
   GOOGLE_CLIENT_ID: ""
-  DRIVE_FOLDER_ID: "13AKqlzDsTmjIHCCoCfSOkW7pTRYHfTVl"
+  DRIVE_FOLDER_ID: "your-drive-folder-id"
   SCREEN_ENABLED: "false"
   # PUBLIC_URL: "https://recorder.example.com"   # ใส่โดเมนจริงแล้วเอา # ออก (ต้องตรงกับ k8s/ingress.yaml) ไม่มี / ท้าย
   HTTP_PORT: "8080"
