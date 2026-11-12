@@ -48,7 +48,7 @@ let beat;
 const startBeat = () => {
   beat ??= setInterval(() => {
     for (const rec of registry.values()) {
-      if (rec.state === 'live' && Date.now() - rec.lastSeen > T.dead) rec.exit('⚠️ หน้าอัดจอถูกปิดหรือเน็ตหลุด');
+      if (rec.state === 'live' && Date.now() - rec.lastSeen > T.dead) rec.exit(rec.via === 'agent' ? '⚠️ ตัวอัดหลุด (ปิดเครื่องหรือเน็ตหลุด)' : '⚠️ หน้าอัดจอถูกปิดหรือเน็ตหลุด', true, 'gone');
     }
   }, T.beat).unref();
 };
@@ -63,10 +63,10 @@ const gaps = (have, last) => {
 };
 
 export class BrowserCapture {
-  constructor(dir, { guildId, owner, offerMs = T.offer }) {
+  constructor(dir, { guildId, owner, offerMs = T.offer, via = 'page' }) {
     Object.assign(this, {
-      dir, guildId, owner, chunks: join(dir, 'chunks'),
-      capId: randomBytes(16).toString('base64url'), kind: 'browser', what: 'จอ (เบราว์เซอร์)',
+      dir, guildId, owner, via, chunks: join(dir, 'chunks'),
+      capId: randomBytes(16).toString('base64url'), kind: 'browser', what: via === 'agent' ? 'จอ (ตัวอัด)' : 'จอ (เบราว์เซอร์)',
       state: 'offered', bytes: 0, maxSeq: -1, lastSeen: Date.now(), notes: '',
       writes: new Set(), have: new Set(), inflight: new Set(), onLive: null,
     });
@@ -82,9 +82,11 @@ export class BrowserCapture {
 
   // ended on its own (offer expired, page closed/stopped, size cap): index.js finishes it with this reason;
   // every self-exit is skip-worthy, the sharer has to stop sharing in Discord before being offered again
-  exit(reason, skip = true) {
+  // exitKind tells index.js why without parsing text: 'local' the owner stopped it (or the offer lapsed),
+  // 'gone' the page/agent vanished or closed, 'cap' a size limit
+  exit(reason, skip = true, kind = 'local') {
     if (this.exitReason || this.stopping) return;
-    Object.assign(this, { exitReason: reason, exitSkip: skip, stopRequested: true });
+    Object.assign(this, { exitReason: reason, exitSkip: skip, exitKind: kind, stopRequested: true });
     clearTimeout(this.offerTimer);
     this.resolveExit();
   }
@@ -159,7 +161,7 @@ export class BrowserCapture {
     if (this.have.has(seq)) { await finished(stream.resume()); return { ok: true, stop: Boolean(this.stopRequested) }; }
     if (this.inflight.has(seq)) throw fail(409);
     if (this.bytes + len > MAX_BYTES || totalBytes + len > TOTAL_BYTES) {
-      this.exit(this.bytes + len > MAX_BYTES ? '⚠️ ไฟล์ใหญ่ถึงขีดจำกัด' : '⚠️ พื้นที่เก็บไฟล์ของบอทเต็ม');
+      this.exit(this.bytes + len > MAX_BYTES ? '⚠️ ไฟล์ใหญ่ถึงขีดจำกัด' : '⚠️ พื้นที่เก็บไฟล์ของบอทเต็ม', true, 'cap');
       throw fail(413, { stop: true });
     }
     this.bytes += len; // reserved now so parallel uploads can't overshoot the caps together
@@ -200,17 +202,20 @@ export class BrowserCapture {
     }
   }
 
-  // the page says it stopped: reason 'page' | 'ended' | 'unload', last = its last seq
+  // the page/agent says it stopped: reason 'page' | 'ended' | 'unload' | 'agent', last = its last seq
   pageStop(reason, last) {
     if (this.state !== 'live' && this.state !== 'stopping') throw fail(410, { stop: true });
     this.seen();
     // a bogus "last" must not invent thousands of gaps
     if (Number.isInteger(last) && last >= -1 && last <= this.maxSeq + 50) this.pageLast = last;
     this.pageReason = reason;
+    const agent = this.via === 'agent';
     this.exit({
       page: '⏹️ หยุดจากหน้าอัดจอ',
       ended: '⏹️ เลิกแชร์จอในเบราว์เซอร์',
-    }[reason] ?? '⚠️ หน้าอัดจอถูกปิด');
+      agent: '⏹️ เจ้าของเครื่องกดหยุดที่ตัวอัด',
+    }[reason] ?? (agent ? '⚠️ ตัวอัดถูกปิด' : '⚠️ หน้าอัดจอถูกปิด'),
+    true, ['page', 'ended', 'agent'].includes(reason) ? 'local' : 'gone');
     return { ok: true, stop: true };
   }
 
@@ -229,15 +234,18 @@ export class BrowserCapture {
       if (!this.liveAt) return null; // never claimed: nothing recorded
       this.state = 'stopping';
       // let the page flush MediaRecorder and its queue (it drains up to 30 s): wait for its stop, 35 s,
-      // or a page that's already gone (nothing heard for 15 s)
-      const t0 = Date.now();
-      while (this.pageReason == null && Date.now() - t0 < T.drainMax && Date.now() - this.lastSeen < T.silent) {
+      // or a page that's already gone (nothing heard for 15 s). An agent gets 45 s: a slow uplink has a longer tail.
+      const t0 = Date.now(), max = T.drainMax * (this.via === 'agent' ? 45 / 35 : 1);
+      while (this.pageReason == null && Date.now() - t0 < max && Date.now() - this.lastSeen < T.silent) {
         await new Promise((r) => setTimeout(r, T.poll));
       }
       while (this.writes.size) await Promise.allSettled([...this.writes]);
       this.state = 'finalizing'; // no await since the loop's empty check: every later upload gets 410
       try {
-        return await this.finalize();
+        const out = await this.finalize();
+        // the agent may delete its local copy now (/result {received}); not when chunks were missing
+        this.received = !this.gapped;
+        return out;
       } catch (e) {
         await rm(this.chunks, { recursive: true, force: true }); // nothing usable left in them
         throw e;
@@ -256,7 +264,7 @@ export class BrowserCapture {
       .filter((f) => /^\d{6}\.bin$/.test(f)).map((f) => parseInt(f, 10)).sort((a, b) => a - b);
     const have = new Set(files);
     if (!have.has(0)) throw new Error('ไม่ได้รับวิดีโอจากเบราว์เซอร์');
-    const missing = gaps(have, Math.max(this.pageLast ?? -1, this.maxSeq));
+    const missing = this.gapped = gaps(have, Math.max(this.pageLast ?? -1, this.maxSeq));
     if (missing) this.notes += `\n⚠️ วิดีโอขาดหาย ${missing} ช่วง`;
     const paths = files.map((s) => join(this.chunks, `${String(s).padStart(6, '0')}.bin`));
     const ext = this.h264 ? 'mp4' : 'webm';

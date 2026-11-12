@@ -29,7 +29,8 @@ const DRIVE = 'https://drive.google.com/file/d/x/view';
 function stub(mode) {
   window.__mode = mode; // 'ok' | 'reject' | 'unsupported' | 'none'
   if (mode === 'none') { delete navigator.mediaDevices.getDisplayMedia; try { Object.defineProperty(navigator, 'mediaDevices', { value: undefined }); } catch {} return; }
-  navigator.mediaDevices.getDisplayMedia = async () => {
+  navigator.mediaDevices.getDisplayMedia = async (asked) => {
+    window.__gdm = asked; // the constraints the page asked for
     if (window.__mode === 'reject') throw new DOMException('no gesture', 'NotAllowedError');
     if (window.__mode === 'unsupported') throw new DOMException('not here', 'NotSupportedError');
     const c = document.createElement('canvas');
@@ -138,6 +139,18 @@ describe('capture page in headless Chrome', { skip }, () => {
     assert.equal(rec.state, 'offered');
     rec.exit('test'); await rec.stop();
     await page.close();
+  });
+
+  test('capture area: ?area=discord asks for the Discord window (hint text + displaySurface window); default monitor', async () => {
+    for (const [q, surface, hintRe] of [['?area=discord', 'window', /เลือกหน้าต่าง Discord แล้วกด แชร์/], ['', 'monitor', /เลือกจอที่จะอัด แล้วกด แชร์/]]) {
+      const rec = fresh();
+      const page = await open(`${rec.link()}${q}`, 'reject'); // rejected: the hint stays on screen
+      await until(() => page.evaluate(() => Boolean(window.__gdm)), 10000, 'getDisplayMedia called');
+      assert.equal(await page.evaluate(() => window.__gdm.video.displaySurface), surface, q || 'default');
+      assert.match(await text(page, '#hint'), hintRe);
+      rec.exit('test'); await rec.stop();
+      await page.close();
+    }
   });
 
   // U20: no getDisplayMedia -> the page asks the bot (POST /voice) to record the room instead

@@ -1,6 +1,10 @@
 import { Collection, ChannelType } from 'discord.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { Readable } from 'node:stream';
+import { ACK_ERROR, AGENT_MIME, STOP_REASON } from '../../src/agent/protocol.js';
+import { capToken } from '../../src/agent-hub.js';
 
 // just enough of discord.js's Guild / Member / Channel / Interaction for src/index.js, all calls recorded
 
@@ -50,6 +54,11 @@ function textLike(guild, props) {
         const m = ch.messages.store.get(id);
         if (!m) throw discordError(10008, 'Unknown Message');
         return m.edit(p);
+      },
+      async delete(id) {
+        const m = ch.messages.store.get(id);
+        if (!m) throw discordError(10008, 'Unknown Message');
+        return m.delete();
       },
     },
     permissionsFor: () => ({ has: () => !ch.noPerms }),
@@ -188,4 +197,242 @@ export class FakeScreenRecorder {
     this.die();
     return f;
   }
+}
+
+// the agent side of the bot: a stand-in for AgentHub (src/agent-hub.js) with the same public API
+// (load, newPairing, devices, allDevices, revoke, revokeDevice, online, start, stop, onChange, _reset). No HTTP, no long-poll: tests
+// drive the "agent" by hand. A started capture goes live through the REAL BrowserCapture (claim with the
+// signed token, via 'agent'), so onLive / liveAt / stop() / exitReason / exitKind behave as in production.
+// Needs PUBLIC_URL set before browser-capture.js is imported (capture.link() is used for the token).
+
+const PAIR_MS = 10 * 60000;
+const GONE_TEXT = '⚠️ ตัวอัดหลุด (ปิดเครื่องหรือเน็ตหลุด)'; // same as BrowserCapture's heartbeat text for via 'agent'
+
+export class FakeAgentHub {
+  static instances = [];
+  constructor() {
+    this.onChange = null; // (userId, online) => {}, fires on transitions only; kept across _reset like the real one
+    this.startMode = 'ok'; // what start() does: 'ok' | 'hold' (wait for ack()) | an ACK_ERROR value (acks that error)
+    this.plan = []; // modes for the next start() calls, consumed first (hub.plan.push('declined'))
+    this.realFinalize = false; // true: leave capture.finalize alone (real ffmpeg remux of uploaded chunks)
+    FakeAgentHub.instances.push(this);
+    this._init();
+  }
+
+  _init() {
+    Object.assign(this, {
+      active: new Map(),   // userId -> {deviceId, name, askFirst}  (online)
+      known: new Map(),    // userId -> [{deviceId, name, os, lastSeen}]
+      pairings: [],        // every newPairing() result, {userId, guildId, tag, token, code, expires}
+      revoked: [],         // [userId, which, count]
+      kicked: [],          // every revokeDevice() that removed one: [deviceId, userId]
+      calls: [],           // every start(): {userId, capture, capId, maxMs, room, by, area, mode, result, settled}
+      pending: [],         // start() calls held by 'hold' mode, oldest first
+      stops: [],           // every stop(): {userId, capId}
+      recording: new Map(), // userId -> the capture the device is recording (busy while it runs)
+      byCap: new Map(),    // capId -> capture that went live through this hub
+    });
+  }
+
+  async load() {} // the real one reads data/agents.json
+
+  // --- the AgentHub API ----------------------------------------------------------
+
+  newPairing(userId, guildId, tag = null) {
+    const p = { userId, guildId, tag, token: randomBytes(16).toString('base64url'),
+      code: String(Math.floor(Math.random() * 1e6)).padStart(6, '0'), expires: Date.now() + PAIR_MS };
+    this.pairings = this.pairings.filter((x) => x.userId !== userId).concat(p); // replaces the user's previous one
+    return { token: p.token, code: p.code, expires: p.expires };
+  }
+
+  devices(userId) {
+    const on = this.active.get(userId);
+    return (this.known.get(userId) ?? []).map((d) => ({ ...d, active: on?.deviceId === d.deviceId }))
+      .sort((a, b) => b.lastSeen - a.lastSeen);
+  }
+
+  revoke(userId, which) {
+    const list = this.known.get(userId) ?? [];
+    const gone = list.filter((d) => which === 'all' || d.deviceId === which);
+    this.known.set(userId, list.filter((d) => !gone.includes(d)));
+    if (gone.some((d) => d.deviceId === this.active.get(userId)?.deviceId)) this.setOnline(userId, false);
+    this.revoked.push([userId, which, gone.length]);
+    return gone.length;
+  }
+
+  allDevices() {
+    return [...this.known].flatMap(([userId, list]) => list.map((d) => ({ guildId: null, ...d, userId, active: this.active.get(userId)?.deviceId === d.deviceId })))
+      .sort((a, b) => b.lastSeen - a.lastSeen);
+  }
+
+  revokeDevice(deviceId) {
+    for (const [userId, list] of this.known) {
+      const d = list.find((x) => x.deviceId === deviceId);
+      if (!d) continue;
+      this.known.set(userId, list.filter((x) => x !== d));
+      if (this.active.get(userId)?.deviceId === deviceId) this.setOnline(userId, false);
+      this.kicked.push([deviceId, userId]);
+      return { userId, name: d.name };
+    }
+    return null;
+  }
+
+  online(userId) {
+    const o = this.active.get(userId);
+    return o ? { ...o } : null;
+  }
+
+  // -> Promise<{ok:true} | {ok:false, error}>, like AgentHub.start: offline / busy answer without a command
+  async start(userId, capture, { maxMs, room, by, area } = {}) {
+    const call = { userId, capture, capId: capture.capId, maxMs, room, by, area, mode: null, result: null, settled: false };
+    this.calls.push(call);
+    const early = (error) => { call.settled = true; return (call.result = { ok: false, error }); };
+    if (!this.active.has(userId)) return early(ACK_ERROR.offline);
+    const cur = this.recording.get(userId);
+    if (cur && cur !== capture && !cur.stopRequested && cur.state !== 'done') return early(ACK_ERROR.busy);
+    this.recording.set(userId, capture); // reserved synchronously, like the real hub
+    capture.exited.then(() => this.recording.get(userId) === capture && this.recording.delete(userId), () => {});
+    call.mode = this.plan.length ? this.plan.shift() : this.startMode;
+    return new Promise((resolve) => {
+      call.resolve = resolve;
+      if (call.mode === 'hold') this.pending.push(call);
+      else Promise.resolve().then(() => this._settle(call, call.mode)); // the ack arrives after the caller's await
+    });
+  }
+
+  // best effort, like the real one; the "agent" obeys: it stops ffmpeg and posts stop (reason 'agent').
+  // -> whether the user's device is online
+  stop(userId, capId) {
+    this.stops.push({ userId, capId });
+    const cap = this.byCap.get(capId);
+    const obey = () => { try { cap.pageStop(STOP_REASON.local, cap.maxSeq); } catch { /* already finished */ } };
+    if (cap) {
+      if (cap.stopping) obey(); // bot stopped it first: the page-stop lets finish() skip its drain wait
+      else setTimeout(obey, 0);
+    }
+    return this.active.has(userId);
+  }
+
+  _reset() {
+    for (const c of this.pending.splice(0)) this._settle(c, ACK_ERROR.offline);
+    this._init();
+    this.plan = [];
+    this.startMode = 'ok';
+    this.realFinalize = false;
+    this.note = null;
+  }
+
+  // --- test controls -------------------------------------------------------------
+
+  // device online/offline. opts: {askFirst, name, deviceId} or false/null = offline. Fires onChange on transitions.
+  setOnline(userId, opts = {}) {
+    const was = this.active.has(userId);
+    if (!opts) this.active.delete(userId);
+    else {
+      const { askFirst = false, name = 'เครื่องทดสอบ', deviceId } = opts;
+      const dev = (this.known.get(userId) ?? []).find((d) => (deviceId ? d.deviceId === deviceId : true)) ?? this.addDevice(userId, { name, deviceId });
+      this.active.set(userId, { deviceId: dev.deviceId, name: dev.name, askFirst });
+    }
+    const now = this.active.has(userId);
+    if (now !== was) this.onChange?.(userId, now);
+  }
+
+  // guildId: the server it was paired from (undefined = an old record without one); lastSeen orders the lists
+  addDevice(userId, { name = 'เครื่องทดสอบ', os = 'test', deviceId = randomBytes(8).toString('base64url'), guildId, lastSeen = Date.now() } = {}) {
+    const d = { deviceId, name, os, lastSeen, ...(guildId ? { guildId } : {}) };
+    this.known.set(userId, [...(this.known.get(userId) ?? []), d]);
+    return d;
+  }
+
+  // resolves a held start() (mode 'hold'): result 'ok' (claims + acks ok) or an ACK_ERROR value. Returns the call.
+  ack(result = 'ok', which = 0) {
+    const call = this.pending[which];
+    if (!call) throw new Error('FakeAgentHub.ack: no start() is waiting');
+    this._settle(call, result);
+    return call;
+  }
+
+  // the agent claims the capture with its signed token (like page.js / agent/capture.js) and acks
+  _settle(call, mode) {
+    if (call.settled) return;
+    call.settled = true;
+    this.pending = this.pending.filter((c) => c !== call);
+    const cap = call.capture;
+    let result = { ok: true };
+    if (mode === 'ok') {
+      try {
+        cap.claim(capToken(cap, PAIR_MS), AGENT_MIME); // fires cap.onLive synchronously, as in production
+        this.byCap.set(cap.capId, cap);
+        if (!this.realFinalize) { // no ffmpeg: a file instead of the remux
+          cap.finalize = async () => {
+            await mkdir(cap.dir, { recursive: true });
+            const f = join(cap.dir, 'screen.mp4');
+            await writeFile(f, 'mp4');
+            return f;
+          };
+        }
+        if (this.note) result.note = this.note; // e.g. the Discord window not found: the whole screen instead
+      } catch { result = { ok: false, error: ACK_ERROR.ffmpeg }; } // stopped / spent token: the agent can't start
+    } else if (mode === 'unclaimed') result = { ok: true }; // acks ok although the capture was never claimed
+    else result = { ok: false, error: mode };
+    if (!result.ok && this.recording.get(call.userId) === cap) this.recording.delete(call.userId);
+    call.result = result;
+    call.resolve(result);
+  }
+
+  // the capture this user's device is recording now (or null)
+  capture(userId) {
+    const c = this.recording.get(userId);
+    return c && c.state !== 'done' ? c : null;
+  }
+
+  // the agent uploads n numbered chunks (real putChunk, so bytes/maxSeq/have move like a real upload)
+  async upload(userId, n = 1, bytes = 64) {
+    const cap = this.capture(userId);
+    if (!cap) throw new Error('FakeAgentHub.upload: nothing is recording');
+    for (let k = 0; k < n; k++) {
+      const buf = Buffer.alloc(bytes, 1);
+      await cap.putChunk(cap.maxSeq + 1, Readable.from([buf]), buf.length);
+    }
+    return cap;
+  }
+
+  // the owner pressed "s" on the agent: POST stop {reason:'agent'} (exitKind 'local')
+  localStop(userId, last) {
+    const cap = this.capture(userId);
+    cap.pageStop(STOP_REASON.local, last ?? cap.maxSeq);
+    return cap;
+  }
+
+  // Ctrl+C on the agent: POST stop {reason:'unload'} (exitKind 'gone')
+  quit(userId) {
+    const cap = this.capture(userId);
+    cap.pageStop(STOP_REASON.quit, cap.maxSeq);
+    return cap;
+  }
+
+  // the agent vanishes (machine off, network lost): the heartbeat's exit, exitKind 'gone', and by default offline
+  drop(userId, { offline = true } = {}) {
+    const cap = this.capture(userId);
+    cap?.exit(GONE_TEXT, true, 'gone');
+    if (offline) this.setOnline(userId, false);
+    return cap;
+  }
+}
+
+// deps.composeMeeting fake: writes dir/meeting.mp4 and returns {file, reencoded}, no ffmpeg.
+// fn.calls = the args of every call; fn.reencoded = true/false/undefined (undefined: reencoded when not exactly 1 segment);
+// fn.fails = an Error to throw; fn.hook = async (args) => {} to hold or throw
+export function fakeComposeMeeting() {
+  const fn = async (args, opts) => {
+    fn.calls.push({ ...args, opts });
+    await fn.hook?.(args);
+    if (fn.fails) throw fn.fails;
+    await mkdir(args.dir, { recursive: true });
+    const file = join(args.dir, 'meeting.mp4');
+    await writeFile(file, 'meeting');
+    return { file, reencoded: fn.reencoded ?? args.segments.length !== 1 };
+  };
+  Object.assign(fn, { calls: [], reencoded: undefined, fails: null, hook: null });
+  return fn;
 }

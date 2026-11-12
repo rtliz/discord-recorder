@@ -5,11 +5,25 @@ import { dirname } from 'node:path';
 // env values are only the defaults for servers that haven't saved anything yet
 const FILE = process.env.SETTINGS_FILE || 'data/settings.json';
 const list = (v = '') => v.split(',').map((x) => x.trim()).filter(Boolean);
+// what a share does: 'off' nothing · 'card' a 🔴 card, nothing records until pressed · 'auto' the sharer's online agent
+// records by itself (no agent: the card). Env: SHARE_CARDS = true|card / auto / false|off; when unset, the legacy
+// AUTO_SCREEN=true means 'auto' (what it did before press-to-start), false 'off'
+export const SHARE_MODES = ['off', 'card', 'auto'];
+const envShare = { true: 'card', card: 'card', auto: 'auto', false: 'off', off: 'off' };
+const DEFAULT_SHARE = envShare[process.env.SHARE_CARDS] ?? (process.env.AUTO_SCREEN === 'true' ? 'auto' : 'off');
+// screen mode: with PUBLIC_URL, 'agent' (the person's recorder agent, else the 🎥 link) or 'browser' (always the link);
+// the host-Mac modes 'screen' / 'window' are only left for a bot without PUBLIC_URL. With PUBLIC_URL a saved or env
+// 'screen' / 'window' reads as 'agent' (the file is untouched)
+const DEFAULT_AREA = process.env.CAPTURE_AREA === 'discord' ? 'discord' : 'screen'; // env default for the capture area
+const agentModes = Boolean(process.env.PUBLIC_URL);
+const modeIn = (m) => (agentModes ? (m === 'browser' ? 'browser' : 'agent') : m === 'window' ? 'window' : 'screen');
 const DEFAULTS = {
-  autoScreen: process.env.AUTO_SCREEN === 'true',               // off until a server opts in (screen = the host Mac's)
-  autoVoice: 'off',                                              // 'off' | 'screen' (with the screen recording) | 'members'
-  minMembers: Number(process.env.AUTO_SCREEN_MIN_MEMBERS) || 2,  // humans in the room before auto recording kicks in
-  mode: ['window', 'browser'].includes(process.env.SCREEN_MODE) ? process.env.SCREEN_MODE : 'screen',
+  shareMode: DEFAULT_SHARE,
+  shareCards: DEFAULT_SHARE !== 'off',                           // derived from shareMode on every read (kept for readers): any card at all
+  autoVoice: 'off',                                              // always 'off': press-to-start has no auto voice (kept so old readers don't break)
+  minMembers: Number(process.env.AUTO_SCREEN_MIN_MEMBERS) || 2,  // humans in the room before a card is posted
+  mode: modeIn(process.env.SCREEN_MODE),
+  area: DEFAULT_AREA,                                            // capture area: 'screen' the whole screen, 'discord' only the Discord window
   channels: list(process.env.AUTO_SCREEN_CHANNEL_IDS),           // voice channels to watch, [] = all
   roles: [],                                                     // sharers must have one of these, [] = anyone
   notifyChannel: null,                                           // text channel for auto recordings, null = the voice channel's chat
@@ -45,8 +59,21 @@ if (text !== null) {
 }
 
 export const getSettings = (guildId) => {
-  const s = { ...DEFAULTS, ...all[guildId] };
-  if (s.autoVoice === 'screen') s.autoVoice = 'off'; // legacy value: the room's audio now always comes with a screen recording
+  const saved = all[guildId] ?? {};
+  const s = { ...DEFAULTS, ...saved };
+  // legacy keys stay in the file untouched; they are only translated here: a saved shareMode wins, then the A5
+  // boolean shareCards, then the pre-press-to-start keys (autoScreen on = auto, auto voice for members = card)
+  s.shareMode = SHARE_MODES.includes(saved.shareMode) ? saved.shareMode
+    : typeof saved.shareCards === 'boolean' ? (saved.shareCards ? 'card' : 'off')
+      : saved.autoScreen === true ? 'auto'
+        : saved.autoVoice === 'members' ? 'card'
+          : saved.autoScreen === false ? 'off' // an explicit old "off" beats the env default
+            : DEFAULTS.shareMode;
+  s.shareCards = s.shareMode !== 'off';
+  s.mode = saved.mode === undefined ? DEFAULTS.mode : modeIn(saved.mode);
+  s.area = saved.area === 'discord' || saved.area === 'screen' ? saved.area : DEFAULTS.area; // anything else: the default
+  delete s.autoScreen;
+  s.autoVoice = 'off'; // 'members' was removed (press-to-start); 'screen' was already folded into off
   return s;
 };
 

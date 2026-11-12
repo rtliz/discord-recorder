@@ -15,10 +15,7 @@ flowchart TD
     R -->|"timeout"| E2["SCREEN_PERMISSION<br/>แสดงปุ่ม 🔐 เปิด System Settings"]
 
     OK --> STOP["/screen stop หรือ ⏹️"]
-    STOP --> AS{"เป็นการอัดอัตโนมัติ?"}
-    AS -->|"ใช่"| SKIP["ใส่คนที่แชร์ไว้ใน autoSkip"]
-    AS -->|"ไม่"| Q
-    SKIP --> Q["ส่ง 'q' ให้ ffmpeg"]
+    STOP --> Q["ส่ง 'q' ให้ ffmpeg<br/>(จอ Mac ที่มาจากการ์ด 🔴 เป็น segment ของ session ดู 6 และ 12<br/>คนแชร์จะอยู่ใน cardSkip ตอน session จบ)"]
     Q --> Q1{"exit ภายใน 15 วินาที?"}
     Q1 -->|"ใช่"| DL["deliver screen.mp4"]
     Q1 -->|"ไม่"| Q2["SIGINT แล้วรอ 5 วินาที"]

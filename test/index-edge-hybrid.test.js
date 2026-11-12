@@ -3,8 +3,9 @@ import { test, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadBot, waitFor, sleep, scene, resetFakes } from './helpers/bot.js';
 import { fakeInteraction, fakeMember, moveMember, FakeScreenRecorder } from './helpers/fakes.js';
+import { startSession, pressRec } from './helpers/session.js';
 
-// both host-Mac screen and browser capture available: mode changes mid-recording, and which kinds share the one screen
+// both host-Mac screen and browser capture available: with PUBLIC_URL only agent / browser are used (the Mac is hidden)
 
 const { bot, uploads, fire } = await loadBot({ SCREEN_ENABLED: 'true', PUBLIC_URL: 'http://localhost:1' });
 const { updateSettings, getSettings } = await import('../src/settings.js');
@@ -16,7 +17,7 @@ const press = (s, customId, extra = {}) => {
 const share = (s, on = true) => fire('voiceStateUpdate', ...moveMember(s.member, { streaming: on }));
 const autoScene = async (mode) => {
   const s = scene(bot);
-  await updateSettings(s.guild.id, { autoScreen: true, minMembers: 2, minShareSeconds: 0, mode });
+  await updateSettings(s.guild.id, { shareCards: true, minMembers: 2, minShareSeconds: 0, mode });
   moveMember(fakeMember(s.guild, { name: 'Other' }), { channel: s.room });
   return s;
 };
@@ -25,58 +26,41 @@ beforeEach(() => { bot._reset(); bot.client.guilds.cache.clear(); resetFakes(); 
 afterEach(() => sleep(80));
 after(() => bot._reset());
 
-test('mode switched browser → screen while an offer runs: the offer stays, no Mac recorder starts', async () => {
+// host-Mac capture is no longer selectable once PUBLIC_URL is set: the modes are agent / browser
+test('host Mac + PUBLIC_URL: a saved screen/window reads as agent; 🔴 without an agent gives the link, never the host Mac', async () => {
+  for (const mode of ['screen', 'window']) {
+    const s = await autoScene(mode);
+    assert.equal(getSettings(s.guild.id).mode, 'agent', mode);
+    const sess = await startSession(bot, s);
+    assert.equal(sess.cur.source, 'link', mode);
+    assert.equal(FakeScreenRecorder.instances.length, 0, 'the host Mac never records');
+    share(s, false);
+    await waitFor(() => !screen.has(s.guild.id) && !voice.has(s.guild.id), 'ended');
+  }
+});
+
+test('host Mac + PUBLIC_URL: config:mode only takes agent / browser', async () => {
   const s = await autoScene('browser');
-  share(s);
-  const g = s.guild.id;
-  await waitFor(() => screen.get(g)?.paired, 'offer + paired');
-  const rec = screen.get(g);
   await press(s, 'config:mode', { kind: 'select', values: ['screen'] });
-  assert.equal(getSettings(g).mode, 'screen');
-  await sleep(40);
-  assert.ok(screen.get(g) === rec);
+  assert.equal(getSettings(s.guild.id).mode, 'browser', 'screen refused');
+  await press(s, 'config:mode', { kind: 'select', values: ['agent'] });
+  assert.equal(getSettings(s.guild.id).mode, 'agent');
+});
+
+test('an old screen:start button (host Mac) maps to 🖥️ อัดจอ: the presser\'s agent path, here the link with a note', async () => {
+  const s = await autoScene('agent');
+  const i = await press(s, 'screen:start');
+  assert.match(i.replies[0].content, /^⚠️ เครื่องของคุณยังไม่ได้เปิดตัวอัด/);
+  assert.equal(screen.get(s.guild.id).kind, 'browser');
   assert.equal(FakeScreenRecorder.instances.length, 0);
-  share(s, false);
-  await waitFor(() => !screen.has(g) && !voice.has(g), 'ended');
+  await screen.get(s.guild.id).stop();
 });
 
-test('mode switched screen → browser while the Mac records: the video goes on, the next share gets an offer', async () => {
-  const s = await autoScene('screen');
-  share(s);
-  const g = s.guild.id;
-  await waitFor(() => screen.get(g)?.paired, 'mac + paired');
-  const rec = screen.get(g);
-  assert.equal(rec.kind, 'mac');
-  await press(s, 'config:mode', { kind: 'select', values: ['browser'] });
-  await sleep(40);
-  assert.ok(screen.get(g) === rec);
-  share(s, false);
-  await waitFor(() => !screen.has(g), 'ended');
-  await sleep(60);
-  share(s, true);
-  await waitFor(() => screen.get(g)?.kind === 'browser', 'browser offer for the next share');
-});
-
-test('the Mac busy in one server does not block a browser offer in another, and browser offers do not make the Mac busy', async () => {
-  const a = await autoScene('screen');
-  const b = await autoScene('browser');
-  const c = await autoScene('screen');
-  share(a);
-  await waitFor(() => screen.get(a.guild.id)?.kind === 'mac', 'A on the Mac');
-  share(b);
-  await waitFor(() => screen.get(b.guild.id)?.kind === 'browser', 'B offered despite the busy Mac');
-  share(c);
-  await sleep(60);
-  assert.equal(screen.has(c.guild.id), false, 'C waits for the Mac');
-  share(a, false);
-  await waitFor(() => screen.get(c.guild.id)?.kind === 'mac', 'C gets the Mac when A is done');
-});
-
-test('a browser offer in A never blocks the Mac in B', async () => {
-  const a = await autoScene('browser');
-  const b = await autoScene('screen');
-  share(a);
-  await waitFor(() => screen.has(a.guild.id), 'A offered');
-  share(b);
-  await waitFor(() => screen.get(b.guild.id)?.kind === 'mac', 'B on the Mac');
+test('panel (D12): with PUBLIC_URL 🖥️ (agent) + 🌐 (link) whatever the mode; never the host-Mac button', async () => {
+  const s = scene(bot);
+  const btn = () => bot.panel(s.guild).components[0].toJSON().components.map((c) => c.custom_id);
+  for (const mode of ['browser', 'agent', 'screen', 'window']) {
+    await updateSettings(s.guild.id, { mode });
+    assert.deepEqual(btn(), ['record:start', 'screen:me', 'screen:link'], mode);
+  }
 });

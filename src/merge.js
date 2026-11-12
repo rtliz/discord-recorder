@@ -1,13 +1,14 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { extname } from 'node:path';
 
 // Mux the room's voice track into a screen video without touching the video stream.
 // offsetMs = video start - voice start: > 0 the voice began earlier (trim its head), < 0 later (delay it).
 // Resolves to the new file's path, or null on any failure (caller delivers the files separately).
-const hasAudio = (file) => {
-  const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', file], { encoding: 'utf8' });
-  return r.status === 0 ? r.stdout.trim().length > 0 : null; // null: unreadable
-};
+// async: a slow ffprobe must not block the event loop (gateway heartbeat, agent long-polls); 30 s cap for a hung one
+const hasAudio = (file) => new Promise((resolve) => {
+  execFile('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', file],
+    { encoding: 'utf8', timeout: 30000, killSignal: 'SIGKILL' }, (e, out) => resolve(e ? null : out.trim().length > 0)); // null: unreadable
+});
 
 export function mergeArgs(videoPath, audioPath, offsetMs, withOwnAudio, output) {
   const webm = extname(videoPath).toLowerCase() === '.webm';
@@ -23,8 +24,8 @@ export function mergeArgs(videoPath, audioPath, offsetMs, withOwnAudio, output) 
 
 export async function mergeAudio(videoPath, audioPath, offsetMs = 0, { timeoutMs = 15 * 60000 } = {}) {
   try {
-    const own = hasAudio(videoPath);
-    if (own === null || hasAudio(audioPath) !== true) return null;
+    const [own, voiced] = await Promise.all([hasAudio(videoPath), hasAudio(audioPath)]);
+    if (own === null || voiced !== true) return null;
     const ext = extname(videoPath);
     const output = videoPath.slice(0, -ext.length) + '-with-audio' + ext;
     const proc = spawn('ffmpeg', mergeArgs(videoPath, audioPath, Number(offsetMs) || 0, own, output), { stdio: ['ignore', 'ignore', 'pipe'] });

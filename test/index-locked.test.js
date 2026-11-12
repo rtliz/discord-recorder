@@ -18,13 +18,14 @@ const press = (s, member, customId) => {
 beforeEach(() => { bot._reset(); bot.client.guilds.cache.clear(); resetFakes(); }); // checkAuto sweeps every cached guild
 after(() => bot._reset());
 
-test('the quick page has no toggle when ALLOWED_USER_IDS is set', async () => {
+test('the quick page has no ใครกดอัดได้ select when ALLOWED_USER_IDS is set (new quick page)', async () => {
   const s = scene(bot);
   s.member.user.id = 'VIP';
   const i = await press(s, s.member, 'config:open');
   const view = i.replies[0];
-  assert.ok(!parts(view).some((c) => c.custom_id === 'config:anyone'));
-  assert.deepEqual(parts(view).filter((c) => c.custom_id?.startsWith('config:') && !c.custom_id.startsWith('config:preset')).map((c) => c.custom_id), ['config:page-main', 'config:done']);
+  const idsOf = parts(view).map((c) => c.custom_id);
+  assert.ok(!idsOf.includes('config:anyone') && !idsOf.includes('config:who'));
+  for (const id of ['config:share', 'config:mode', 'config:area', 'config:done']) assert.ok(idsOf.includes(id), id);
   assertDiscordLimits(view, 'quick page, locked');
 });
 

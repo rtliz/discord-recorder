@@ -6,10 +6,12 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "20m"
     nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    # /api/agent/poll ค้างรอได้ถึง 25 วิ (long-poll) timeout ต้องมากกว่านั้นมาก: 120 พอ (ห้ามต่ำกว่า 60)
     nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
     # จำกัดคำขอต่อ IP (บอทไม่มี lockout รวมแล้ว): หน้าอัดจอปกติใช้ไม่ถึง 1 ครั้ง/วินาที
     # (ส่ง 1 ส่วนทุก 3 วิ + เช็กสถานะทุก 5 วิ) เผื่อ retry ไว้ที่ 10/วิ, burst 5 เท่า
+    # ตัวอัด (agent) poll ทุก ~25 วิ + ส่งชิ้นทุก 3 วิตอนอัด จึงอยู่ในเพดานเดียวกัน (limit นับต่อ IP: คนหลายเครื่องหลัง NAT เดียวกันใช้ร่วมกัน)
     nginx.ingress.kubernetes.io/limit-rps: "10"
     nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
     # cert-manager.io/cluster-issuer: letsencrypt-prod   # เปิดถ้าใช้ cert-manager (แก้ชื่อ issuer ให้ตรง)
@@ -22,7 +24,7 @@ spec:
     - host: recorder.example.com             # แก้เป็น host จริง
       http:
         paths:
-          # เปิดเฉพาะ path ของหน้าอัดจอ; /healthz และอื่น ๆ ไม่ออกสู่ภายนอก
+          # เปิดเฉพาะ path ของหน้าอัดจอและตัวอัด; /healthz และอื่น ๆ ไม่ออกสู่ภายนอก
           - path: /capture
             pathType: Prefix
             backend:
@@ -32,6 +34,15 @@ spec:
             backend:
               service: { name: discord-recorder, port: { name: http } }
           - path: /api/capture
+            pathType: Prefix
+            backend:
+              service: { name: discord-recorder, port: { name: http } }
+          # ตัวอัดบนเครื่องผู้ใช้: สคริปต์ติดตั้ง/manifest/ไฟล์ (/agent) และ long-poll + จับคู่ (/api/agent)
+          - path: /agent
+            pathType: Prefix
+            backend:
+              service: { name: discord-recorder, port: { name: http } }
+          - path: /api/agent
             pathType: Prefix
             backend:
               service: { name: discord-recorder, port: { name: http } }

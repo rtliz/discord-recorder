@@ -121,6 +121,7 @@ describe('browser capture', { skip: !hasFfmpeg() && 'ffmpeg not installed' }, ()
       assert.equal(r.probe.code, 0);
       assert.equal(r.notes, '');
       assert.equal(r.rec.lived, 1);
+      assert.equal(r.rec.received, true, 'whole video finalized: the agent may drop its copy');
       assert.equal(r.st, 200);
       assert.ok(r.rec.liveAt > 0);
       assert.ok(!existsSync(join(r.rec.dir, 'chunks')));
@@ -145,6 +146,7 @@ describe('browser capture', { skip: !hasFfmpeg() && 'ffmpeg not installed' }, ()
       const r = await scenario(fx.webm, MIME_WEBM, all(fx.webm).filter((i) => i !== 3));
       assert.ok(r.file, r.error);
       assert.match(r.notes, /ขาดหาย 1 ช่วง/);
+      assert.equal(r.rec.received, false, 'a gap: the agent keeps its copy');
     });
     test('mp4 middle chunk dropped -> output + note', async () => {
       const r = await scenario(fx.mp4, 'video/mp4', all(fx.mp4).filter((i) => i !== 2));
@@ -154,6 +156,7 @@ describe('browser capture', { skip: !hasFfmpeg() && 'ffmpeg not installed' }, ()
     test('chunk 0 dropped -> error, chunks dir removed', async () => {
       const r = await scenario(fx.webm, MIME_WEBM, all(fx.webm).slice(1));
       assert.equal(r.error, 'ไม่ได้รับวิดีโอจากเบราว์เซอร์');
+      assert.ok(!r.rec.received);
       assert.ok(!existsSync(join(r.rec.dir, 'chunks')));
     });
     test('no chunks -> error', async () => {
@@ -396,6 +399,17 @@ describe('browser capture', { skip: !hasFfmpeg() && 'ffmpeg not installed' }, ()
       const ms = Date.now() - t0;
       assert.ok(ms >= T.drainMax - 60 && ms < T.drainMax + 700, `${ms} ms`);
     });
+    test('live agent: stop() waits 45/35 of T.drainMax (slow uplinks have a longer tail)', async () => {
+      const ra = fresh({ via: 'agent' });
+      const [, c] = await start(ra, 'video/webm');
+      await put(ra, 0, fx.webm[0], c.session);
+      const talk = setInterval(() => status(ra, c.session).catch(() => {}), 100);
+      const t0 = Date.now();
+      await ra.stop();
+      clearInterval(talk);
+      const ms = Date.now() - t0, want = T.drainMax * 45 / 35;
+      assert.ok(ms >= want - 60 && ms < want + 700, `${ms} ms`);
+    });
     test('heartbeat: idle live page -> exit with reason, skip, stop:true', async () => {
       await withT({ dead: 400 }, async () => {
         const rec = fresh();
@@ -421,11 +435,13 @@ describe('browser capture', { skip: !hasFfmpeg() && 'ffmpeg not installed' }, ()
       assert.equal((await get(path)).status, 401);
       assert.equal((await get(path, { authorization: `Bearer ${'x'.repeat(43)}` })).status, 401);
       const h = { authorization: `Bearer ${c.session}` };
-      assert.deepEqual(await (await get(path, h)).json(), { ready: false, url: null });
+      assert.deepEqual(await (await get(path, h)).json(), { ready: false, url: null, received: false });
+      rec.received = true; // finalized: long before compose and upload are done
+      assert.deepEqual(await (await get(path, h)).json(), { ready: false, url: null, received: true });
       rec.result = { url: 'https://drive.google.com/file/d/x/view' };
-      assert.deepEqual(await (await get(path, h)).json(), { ready: true, url: 'https://drive.google.com/file/d/x/view' });
+      assert.deepEqual(await (await get(path, h)).json(), { ready: true, url: 'https://drive.google.com/file/d/x/view', received: true });
       rec.result = { url: null }; // delivered without a link: ready, nothing to open
-      assert.deepEqual(await (await get(path, h)).json(), { ready: true, url: null });
+      assert.deepEqual(await (await get(path, h)).json(), { ready: true, url: null, received: true });
       await rec.stop().catch(() => {});
     });
     test('R15: after KEEP the registry entry is gone -> 404 (a long Drive upload loses the page)', async () => {
@@ -639,6 +655,70 @@ describe('browser capture', { skip: !hasFfmpeg() && 'ffmpeg not installed' }, ()
       } finally {
         blocker.close();
       }
+    });
+  });
+
+  describe('via: agent (texts and exitKind)', () => {
+    const live = async (opts) => {
+      const rec = fresh(opts);
+      const [, c] = await start(rec, MIME_WEBM);
+      await put(rec, 0, fx.webm[0], c.session);
+      return rec;
+    };
+    test('what differs, default via is page', () => {
+      assert.equal(fresh({ via: 'agent' }).what, 'จอ (ตัวอัด)');
+      assert.equal(fresh({ via: 'agent' }).via, 'agent');
+      assert.equal(fresh().what, 'จอ (เบราว์เซอร์)');
+      assert.equal(fresh().via, 'page');
+    });
+    test('agent: stop reasons -> texts + exitKind', async () => {
+      const want = { agent: ['⏹️ เจ้าของเครื่องกดหยุดที่ตัวอัด', 'local'], unload: ['⚠️ ตัวอัดถูกปิด', 'gone'],
+        page: ['⏹️ หยุดจากหน้าอัดจอ', 'local'], ended: ['⏹️ เลิกแชร์จอในเบราว์เซอร์', 'local'] };
+      for (const [reason, [text, kind]] of Object.entries(want)) {
+        const rec = await live({ via: 'agent' });
+        assert.equal(rec.pageStop(reason, 0).stop, true);
+        assert.equal(rec.exitReason, text, reason);
+        assert.equal(rec.exitKind, kind, reason);
+        assert.ok(rec.exitSkip);
+        await rec.stop().catch(() => {});
+      }
+    });
+    test('browser page: unload text unchanged, agent reason falls to kind local', async () => {
+      const a = await live();
+      a.pageStop('unload', 0);
+      assert.equal(a.exitReason, '⚠️ หน้าอัดจอถูกปิด');
+      assert.equal(a.exitKind, 'gone');
+      const b = await live();
+      b.pageStop('page', 0);
+      assert.equal(b.exitReason, '⏹️ หยุดจากหน้าอัดจอ');
+      assert.equal(b.exitKind, 'local');
+      await Promise.all([a.stop().catch(() => {}), b.stop().catch(() => {})]);
+    });
+    test('heartbeat: agent text + gone; page text unchanged + gone', async () => {
+      await withT({ dead: 300 }, async () => {
+        const a = await live({ via: 'agent' });
+        const p = await live();
+        await Promise.all([a.exited, p.exited]);
+        assert.equal(a.exitReason, '⚠️ ตัวอัดหลุด (ปิดเครื่องหรือเน็ตหลุด)');
+        assert.equal(a.exitKind, 'gone');
+        assert.equal(p.exitReason, '⚠️ หน้าอัดจอถูกปิดหรือเน็ตหลุด');
+        assert.equal(p.exitKind, 'gone');
+        await Promise.all([a.stop().catch(() => {}), p.stop().catch(() => {})]);
+      });
+    });
+    test('exitKind: size cap -> cap; offer expiry and plain exit() -> local', async () => {
+      const rec = await live({ via: 'agent' });
+      const big = Buffer.alloc(600 * 1024);
+      await assert.rejects(rec.putChunk(1, Readable.from([big]), big.length), { status: 413 });
+      assert.equal(rec.exitKind, 'cap');
+      await rec.stop().catch(() => {});
+      const o = fresh({ offerMs: 40 });
+      await o.exited;
+      assert.equal(o.exitKind, 'local');
+      const x = fresh({ offerMs: 0 });
+      x.exit('x');
+      assert.equal(x.exitKind, 'local');
+      assert.equal(fresh().exitKind, undefined);
     });
   });
 });

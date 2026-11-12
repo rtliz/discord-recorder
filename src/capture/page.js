@@ -5,6 +5,9 @@
   const startBtn = $('start'), stopBtn = $('stop'), msg = $('msg'), hint = $('hint'), live = $('live');
   const token = location.pathname.split('/')[2] || '';   // /capture/<token>
   const capId = token.split('.')[0];
+  // the server's capture area setting, as a hint only: a browser can't be forced to one window
+  const discordOnly = new URLSearchParams(location.search).get('area') === 'discord';
+  if (discordOnly && token) hint.textContent = 'เลือกหน้าต่าง Discord แล้วกด แชร์';
   const api = `/api/capture/${encodeURIComponent(capId)}`;
   const say = (text, kind = '') => { msg.textContent = text; msg.className = `msg ${kind}`; };
 
@@ -163,7 +166,7 @@
     say('');
     try {
       stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30, max: 30 } },
+        video: { frameRate: { ideal: 30, max: 30 }, displaySurface: discordOnly ? 'window' : 'monitor' },
         audio: true,
         selfBrowserSurface: 'exclude', surfaceSwitching: 'include', systemAudio: 'include', monitorTypeSurfaces: 'include',
       });

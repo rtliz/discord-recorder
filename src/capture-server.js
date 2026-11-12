@@ -1,7 +1,11 @@
 import { createServer } from 'node:http';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { publicUrl, lookup, checkToken, tokenCapId } from './browser-capture.js';
+import { hub } from './agent-hub.js';
+import { PROTOCOL, STOP_REASON } from './agent/protocol.js';
 
 // the HTTP side of browser capture: the page, its two assets, and the upload API.
 // No static file serving: the three assets are read once here and served from memory.
@@ -22,8 +26,39 @@ const loadAssets = () => {
     const path = fileURLToPath(new URL(`./capture/${name}`, import.meta.url));
     try { return readFileSync(path); } catch (e) { throw new Error(`capture page asset missing: ${path} (${e.code})`); }
   };
-  return { html: read('page.html'), js: read('page.js'), css: read('page.css') };
+  return { html: read('page.html'), js: read('page.js'), css: read('page.css'), agent: loadAgentAssets() };
 };
+
+// what may be pasted into the install scripts' quoted SERVER line (no quotes, spaces, $ or `)
+export const SAFE_SERVER = /^https?:\/\/[A-Za-z0-9.:[\]_/-]+$/;
+
+// the recorder agent's public files, read once: src/agent/*.js (the allowlist for /agent/files/<name>),
+// install.{sh,ps1} with __SERVER__ filled in (not served at all when the server URL is unsafe), and
+// manifest.json (file hashes computed here + pins.json)
+export function loadAgentAssets(dir = fileURLToPath(new URL('./agent/', import.meta.url)), server = publicUrl) {
+  const hash = (b) => createHash('sha256').update(b).digest('hex');
+  const optional = (name) => {
+    try { return readFileSync(join(dir, name), 'utf8'); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+  };
+  const files = new Map(readdirSync(dir).filter((f) => /^[a-z][a-z0-9-]*\.js$/.test(f)).sort()
+    .map((f) => [f, readFileSync(join(dir, f))]));
+  const scripts = new Map();
+  if (!SAFE_SERVER.test(server)) {
+    if (server) console.error('PUBLIC_URL มีอักขระที่ใช้ในสคริปต์ติดตั้งไม่ได้: ไม่เปิดให้โหลด /agent/install.sh และ install.ps1');
+  } else for (const name of ['install.sh', 'install.ps1']) {
+    const text = optional(name);
+    if (text !== null) scripts.set(name, Buffer.from(text.replaceAll('__SERVER__', server)));
+  }
+  const pinsText = optional('pins.json');
+  let pins = {};
+  try { pins = pinsText === null ? {} : JSON.parse(pinsText); } catch (e) { throw new Error(`src/agent/pins.json: ${e.message}`); }
+  const list = [...files].map(([name, body]) => ({ name, sha256: hash(body) }));
+  const manifest = {
+    version: hash(list.map((f) => `${f.name}:${f.sha256}`).join('\n')).slice(0, 12), protocol: PROTOCOL,
+    files: list, node: pins.node ?? {}, ffmpeg: pins.ffmpeg ?? {},
+  };
+  return { files, scripts, manifest: Buffer.from(JSON.stringify(manifest, null, 2)) };
+}
 
 // per capture token bucket (20, +1/s) shared by chunk, status, result and voice
 const buckets = new WeakMap();
@@ -67,7 +102,8 @@ async function readJson(req) {
 const bearer = (req) => /^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization ?? '')?.[1];
 
 // without PUBLIC_URL only /healthz is served (k8s probes), no assets are loaded
-export function startCaptureServer(port, { assets = publicUrl ? loadAssets() : null } = {}) {
+// agents: the AgentHub serving /agent/* and /api/agent/* (tests pass their own)
+export function startCaptureServer(port, { assets = publicUrl ? loadAssets() : null, agents = hub } = {}) {
   const { origin, hostname, protocol } = new URL(publicUrl || 'http://localhost');
   if (publicUrl && protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(hostname)) {
     console.warn(`PUBLIC_URL is not https: browsers allow screen capture only on https or localhost`);
@@ -88,6 +124,7 @@ export function startCaptureServer(port, { assets = publicUrl ? loadAssets() : n
 
     if (path === '/healthz') return allow('GET') && send(res, 200, 'ok', { 'Content-Type': 'text/plain' });
     if (!assets) return send(res, 404, ''); // capture off: health only
+    if (path.startsWith('/agent/') || path.startsWith('/api/agent/')) return agents.handle(req, res, path, assets.agent ?? null);
     if (statics[path]) {
       const [body, type] = statics[path];
       return allow('GET') && send(res, 200, body, { 'Content-Type': type });
@@ -135,7 +172,8 @@ export function startCaptureServer(port, { assets = publicUrl ? loadAssets() : n
     if (route === 'result') {
       if (!takeToken(rec)) return json(res, 429, { error: 'slow down' });
       if (!rec.authed(bearer(req))) return json(res, 401, { error: 'auth' });
-      return json(res, 200, { ready: Boolean(rec.result), url: rec.result?.url ?? null });
+      // received: the bot holds the whole video (finalized, no gaps), so an agent can drop its local copy
+      return json(res, 200, { ready: Boolean(rec.result), url: rec.result?.url ?? null, received: Boolean(rec.received) });
     }
     if (rec.state === 'finalizing' || rec.state === 'done') return json(res, 410, { stop: true }, upload);
     if (route !== 'stop' && !takeToken(rec)) return json(res, 429, { error: 'slow down' }, upload);
@@ -144,7 +182,7 @@ export function startCaptureServer(port, { assets = publicUrl ? loadAssets() : n
     if (route === 'status') return json(res, 200, rec.status());
     if (route === 'stop') {
       const body = await readJson(req);
-      if (!['page', 'ended', 'unload'].includes(body.reason)) return json(res, 400, { error: 'reason' });
+      if (!['page', 'ended', 'unload', STOP_REASON.local].includes(body.reason)) return json(res, 400, { error: 'reason' });
       return json(res, 200, rec.pageStop(body.reason, body.last));
     }
 
@@ -168,7 +206,9 @@ export function startCaptureServer(port, { assets = publicUrl ? loadAssets() : n
       json(res, 500, { error: 'server' }, true);
     });
   });
-  Object.assign(server, { requestTimeout: 120000, headersTimeout: 20000, keepAliveTimeout: 5000, maxConnections: 64 });
+  // every online agent holds one long-poll connection: room for them plus the capture pages' uploads
+  Object.assign(server, { requestTimeout: 120000, headersTimeout: 20000, keepAliveTimeout: 5000,
+    maxConnections: Number(process.env.HTTP_MAX_CONNECTIONS) || 512 });
   server.on('clientError', (_, socket) => socket.destroy());
   // e.g. EADDRINUSE: health-only can live without its port, browser capture can't (links would lead nowhere)
   server.on('error', (e) => {

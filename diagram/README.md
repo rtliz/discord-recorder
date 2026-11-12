@@ -9,9 +9,10 @@
 | 3 | [03-routing-permission.md](03-routing-permission.md) | Routing คำสั่งและการตรวจสิทธิ์ |
 | 4 | [04-voice-recording.md](04-voice-recording.md) | Flow อัดเสียง |
 | 5 | [05-screen-recording.md](05-screen-recording.md) | Flow อัดหน้าจอด้วยตัวเอง |
-| 6 | [06-auto-screen.md](06-auto-screen.md) | Flow อัดอัตโนมัติเมื่อมีคนแชร์จอ |
+| 6 | [06-auto-screen.md](06-auto-screen.md) | Flow เมื่อมีคนแชร์จอ: การ์ด 🔴 (กดแล้วถึงอัด) หรือ ⚡ อัดอัตโนมัติ (ตัวอัดออนไลน์) |
 | 7 | [07-settings.md](07-settings.md) | การตั้งค่าราย server |
 | 8 | [08-deliver.md](08-deliver.md) | การส่งไฟล์ (Drive / แนบไฟล์) |
 | 9 | [09-error-handling.md](09-error-handling.md) | Error handling |
 | 10 | [10-deployment.md](10-deployment.md) | Deploy บน Mac และ Kubernetes |
 | 11 | [11-browser-capture.md](11-browser-capture.md) | อัดจอผ่านเบราว์เซอร์ (offer → ลิงก์ → chunk → หยุด → ส่งผล) |
+| 12 | [12-agent.md](12-agent.md) | ตัวอัด (agent): ติดตั้ง/จับคู่, long-poll + start/chunk, สถานะของ session (wait 2 นาที, switch, compose) |

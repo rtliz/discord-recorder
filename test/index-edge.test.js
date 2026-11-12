@@ -3,6 +3,7 @@ import { describe, test, beforeEach, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadBot, waitFor, sleep, scene, resetFakes } from './helpers/bot.js';
 import { fakeInteraction, fakeMember, fakeGuild, fakeTextChannel, moveMember, parts, deferred, FakeVoiceRecorder } from './helpers/fakes.js';
+import { startSession } from './helpers/session.js';
 
 // QA edge cases for index.js in browser-capture mode: several servers, stop paths (one result card each),
 // settings / schedule / max changes mid-recording, restart cleanup. No Discord, no real voice.
@@ -33,19 +34,14 @@ const settle = (ms = 40) => sleep(ms);
 const share = (s, on = true, who = s.member) => fire('voiceStateUpdate', ...moveMember(who, { streaming: on }));
 const autoScene = async (patch = {}, opts = {}) => {
   const s = scene(bot, opts);
-  await updateSettings(s.guild.id, { autoScreen: true, minMembers: 2, minShareSeconds: 0, mode: 'browser', ...patch });
+  await updateSettings(s.guild.id, { shareCards: true, minMembers: 2, minShareSeconds: 0, mode: 'browser', ...patch });
   s.other = fakeMember(s.guild, { name: 'Other' });
   moveMember(s.other, { channel: s.room });
   return s;
 };
-const autoOffer = async (s) => {
-  share(s);
-  const g = s.guild.id;
-  await waitFor(() => screen.get(g)?.paired && voice.get(g) === screen.get(g).paired, 'offer + paired voice');
-  const rec = screen.get(g);
-  await rec.cardQ;
-  return rec;
-};
+// press-to-start: the share posts a room card, the sharer presses 🔴 (no agent: the card link), the bot joins.
+// Resolves the session (kind 'session'); its link capture is .cur.rec
+const autoOffer = (s) => startSession(bot, s);
 // manual 🎥 → page goes live → the bot joins the room (notice posted there)
 const manualLive = async (s) => {
   await press(s, 'screen:me');
@@ -68,25 +64,25 @@ const oneResult = async (s, { video, name = 'result' }) => {
   assert.ok(FakeVoiceRecorder.instances.every((v) => v.stopped), `${name}: voice recorder stopped`);
   assert.equal(voice.size + screen.size, 0);
   assert.equal(uploads.length, 1, `${name}: uploads ${uploads}`);
-  if (video) assert.match(uploads[0], /-with-audio\.\w+$/, `${name}: the merged file`);
+  if (video) assert.match(uploads[0], /-(with-audio|meeting)\.\w+$/, `${name}: the merged file (a session: the meeting)`);
   assert.deepEqual(logs.err.filter((e) => /!!!|TypeError|ReferenceError/.test(e)), [], `${name}: no errors`);
   return r[0];
 };
 
-beforeEach(() => { bot._reset(); bot.client.guilds.cache.clear(); resetFakes(); // old scenes must not keep reacting (checkAuto sweeps every cached guild)
+beforeEach(() => { bot._reset(); bot.client.guilds.cache.clear(); resetFakes(); // old scenes must not keep reacting (checkShares sweeps every cached guild)
   uploads.length = 0; logs.err.length = 0; mock.timers.reset(); });
 after(() => { bot._reset(); mock.timers.reset(); });
 
 describe('two servers at once', () => {
-  test('auto offers in both are independent; ending one leaves the other, results go to their own channels', async () => {
+  test('auto offers in both are independent; ending one leaves the other, results go to their own channels (press-to-start)', async () => {
     const a = await autoScene({}, { name: 'Alice' });
     const b = await autoScene({}, { name: 'Bob' });
     const ra = await autoOffer(a);
     const rb = await autoOffer(b);
     assert.notEqual(ra.dir, rb.dir);
-    assert.notEqual(ra.capId, rb.capId);
+    assert.notEqual(ra.cur.rec.capId, rb.cur.rec.capId);
     assert.equal(FakeVoiceRecorder.instances.length, 2);
-    await waitFor(() => a.guild.members.me.nickname === 'Alice - 🔴 กำลังอัดเสียง' || a.guild.members.me.nickname?.includes('🔴'), 'nick A').catch(() => {});
+    await waitFor(() => a.guild.members.me.nickname?.includes('🔴'), 'nick A');
     share(a, false);
     await waitFor(() => !screen.has(a.guild.id), 'A ended');
     await settle();
@@ -94,7 +90,7 @@ describe('two servers at once', () => {
     assert.equal(FakeVoiceRecorder.instances.find((v) => v.channel === b.room).stopped, false);
     assert.equal(resultsOf(b).length, 0, 'nothing posted for B');
     assert.equal(resultsOf(a).length, 1);
-    assert.equal(b.room.sent.length, 1, 'B has just its offer card');
+    assert.equal(b.room.sent.length, 1, 'B has just its session card');
     share(b, false);
     await waitFor(() => !screen.has(b.guild.id), 'B ended');
     await settle();
@@ -146,12 +142,12 @@ describe('two servers at once', () => {
     void va;
   });
 
-  test('screen-less browser offers: a share in A and a manual 🎥 in B do not block each other', async () => {
+  test('screen-less browser offers: a share in A and a manual 🎥 in B do not block each other (press-to-start)', async () => {
     const a = await autoScene();
     const b = scene(bot);
     await autoOffer(a);
     await press(b, 'screen:me');
-    assert.ok(screen.has(b.guild.id) && screen.has(a.guild.id));
+    assert.ok(screen.has(b.guild.id) && screen.get(a.guild.id)?.kind === 'session');
   });
 });
 
@@ -195,10 +191,20 @@ describe('stop paths: exactly one result card with the right files', () => {
     '/screen stop': (s) => press(s, undefined, { kind: 'slash', command: 'screen', sub: 'stop' }),
     'share ends': (s) => share(s, false),
     'sharer leaves the room': (s) => fire('voiceStateUpdate', ...moveMember(s.member, { channel: null })),
-    'autoScreen switched off': (s) => press(s, 'config:auto'),
+    // cards off never touches a pressed session (only cards are gated): it goes on until a real stop
+    'autoScreen switched off': async (s, rec) => {
+      await press(s, 'config:cards');
+      await settle();
+      assert.equal(screen.get(s.guild.id), rec, 'still recording');
+      return press(s, `screen:stop:${rec.began}`, { message: rec.card });
+    },
+    'all humans leave the room': (s) => {
+      moveMember(s.other, { channel: null });
+      return fire('voiceStateUpdate', ...moveMember(s.member, { channel: null }));
+    },
   };
   for (const [name, stop] of Object.entries(autoPaths)) {
-    test(`auto offer (audio only): ${name}`, async () => {
+    test(`auto offer (audio only): ${name} (press-to-start)`, async () => {
       const s = await autoScene();
       const rec = await autoOffer(s);
       await stop(s, rec);
@@ -209,7 +215,7 @@ describe('stop paths: exactly one result card with the right files', () => {
     });
   }
 
-  test('auto offer: bot dropped from the room ends the offer at once: one audio card, nickname back, sharer skipped', async () => {
+  test('auto offer: bot dropped from the room ends the offer at once: one audio card, nickname back, sharer skipped (press-to-start)', async () => {
     const s = await autoScene();
     const g = s.guild.id;
     s.guild.members.me.nickname = 'Keep Me';
@@ -217,11 +223,11 @@ describe('stop paths: exactly one result card with the right files', () => {
     await waitFor(() => s.guild.members.me.nickname?.includes('🔴'), 'tagged');
     rec.paired.onGone();
     const r = await oneResult(s, { video: false, name: 'dropped' }); // before any share end
-    assert.equal(r, s.room.sent[0], 'the offer card became the result');
+    assert.equal(r, s.room.sent[0], 'the card became the result');
     assert.match(content(lastOf(r)), /^✅ \*\*อัดเสียงในห้องเสร็จแล้ว/);
     assert.match(content(lastOf(r)), /-# ⚠️ บอทหลุดจากห้องเสียง$/);
-    assert.equal(rec.state, 'done');
-    assert.ok(bot.autoSkip.get(g)?.has(s.member.id), 'not re-offered until they stop sharing');
+    assert.equal(rec.segments[0].rec.state, 'done');
+    assert.ok(bot.cardSkip.get(g)?.has(s.member.id), 'not offered a card again until they stop sharing');
     assert.doesNotMatch(content(bot.panel(s.guild)), /🔴|🟡/);
     await waitFor(() => s.guild.members.me.nickname === 'Keep Me', 'nickname back');
     share(s, false); // the share ending later changes nothing
@@ -230,21 +236,22 @@ describe('stop paths: exactly one result card with the right files', () => {
     assert.equal(screen.size + voice.size, 0);
   });
 
-  test('auto offer on a phone (voice only): bot dropped ends it the same way', async () => {
+  test('auto offer on a phone (voice only): bot dropped ends it the same way (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
-    assert.deepEqual(await rec.voiceOnly(rec.link().split('/capture/')[1]), { ok: true, paired: true });
+    const cap = rec.cur.rec;
+    assert.deepEqual(await cap.voiceOnly(tokenOf(cap)), { ok: true, paired: true });
     rec.paired.onGone();
     const r = await oneResult(s, { video: false, name: 'phone dropped' });
     assert.match(content(lastOf(r)), /บอทหลุดจากห้องเสียง/);
-    assert.equal(rec.state, 'done');
+    assert.equal(cap.state, 'done');
   });
 
-  test('R9 kept: live video + bot dropped → video goes on, note on the final card', async () => {
+  test('R9 kept: live video + bot dropped → video goes on, note on the final card (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
-    goLive(rec);
-    await waitFor(() => rec.liveAt, 'live');
+    goLive(rec.cur.rec);
+    await waitFor(() => rec.cur.rec.liveAt, 'live');
     rec.paired.onGone();
     await settle();
     assert.equal(screen.get(s.guild.id), rec, 'video still recording');
@@ -253,43 +260,44 @@ describe('stop paths: exactly one result card with the right files', () => {
     assert.match(content(lastOf(r)), /บอทหลุดจากห้องเสียงกลางทาง/);
   });
 
-  test('auto offer, claimed: share ends → one card with video + audio', async () => {
+  test('auto offer, claimed: share ends → one card with video + audio (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
-    goLive(rec);
-    await waitFor(() => rec.liveAt, 'live');
+    goLive(rec.cur.rec);
+    await waitFor(() => rec.cur.rec.liveAt, 'live');
     share(s, false);
     await oneResult(s, { video: true, name: 'claimed share end' });
   });
 
-  test('auto offer, max length counted from the offer: not re-armed when the page goes live', async () => {
+  test('auto offer, max length counted from the offer: not re-armed when the page goes live (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
     const timer = rec.maxTimer;
-    assert.ok(timer, 'armed at offer time');
-    goLive(rec);
-    await waitFor(() => rec.liveAt, 'live');
+    assert.ok(timer, 'armed at the press');
+    goLive(rec.cur.rec);
+    await waitFor(() => rec.cur.rec.liveAt, 'live');
     assert.equal(rec.maxTimer, timer, 'same timer');
-    const { exp } = { exp: parseInt(rec.cardLink.split('.')[1] ?? '0', 36) };
+    const exp = parseInt(rec.cur.rec.cardLink.split('.')[1] ?? '0', 36);
     assert.ok(exp > Date.now() + 239 * 60000 && exp < Date.now() + 241 * 60000, 'card link lives as long as maxMinutes');
   });
 
-  test('auto offer unopened: max length stops it (audio result), sharer is skipped until they re-share', async () => {
-    const s = await autoScene({ maxMinutes: 0.001 });
-    const rec = await autoOffer(s);
+  test('auto offer unopened: max length stops it (audio result), sharer is skipped until they re-share (press-to-start)', async () => {
+    const s = await autoScene({ maxMinutes: 0.002 });
+    await autoOffer(s);
     const r = await oneResult(s, { video: false, name: 'auto max' });
     assert.match(content(lastOf(r)), /ครบเวลาอัดสูงสุด/);
-    assert.ok(bot.autoSkip.get(s.guild.id)?.has(s.member.id), 'skipped');
+    assert.ok(bot.cardSkip.get(s.guild.id)?.has(s.member.id), 'skipped');
     fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false })); // any event while still sharing
     await settle();
-    assert.equal(screen.size, 0, 'not offered again');
+    assert.equal(screen.size, 0, 'nothing records');
+    assert.ok(!bot.roomCards.has(s.room.id), 'no card offered again');
     share(s, false);
-    share(s, true); // a new share is a new chance
-    await waitFor(() => screen.has(s.guild.id), 'offered again');
-    assert.notEqual(screen.get(s.guild.id), rec);
+    share(s, true); // a new share is a new chance: a card, still nothing recording
+    await waitFor(() => bot.roomCards.get(s.room.id)?.card, 'card again');
+    assert.equal(screen.size, 0);
   });
 
-  test('auto offer unopened: max cut-off ignores the old 5 minute offer length (T.offer shorter than max)', async () => {
+  test('auto offer unopened: max cut-off ignores the old 5 minute offer length (T.offer shorter than max) (press-to-start)', async () => {
     const old = T.offer;
     T.offer = 20;
     try {
@@ -345,10 +353,10 @@ describe('stop paths: exactly one result card with the right files', () => {
     assert.ok(!/^[✅❌]/.test(content(lastOf(i.replyMessage))), 'the link message is not a result');
   });
 
-  test('auto mobile voice-only: the page says paired; share end gives one audio card', async () => {
+  test('auto mobile voice-only: the page says paired; share end gives one audio card (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
-    assert.deepEqual(await rec.voiceOnly(tokenOf(rec)), { ok: true, paired: true });
+    assert.deepEqual(await rec.cur.rec.voiceOnly(tokenOf(rec.cur.rec)), { ok: true, paired: true });
     assert.equal(FakeVoiceRecorder.instances.length, 1);
     share(s, false);
     await oneResult(s, { video: false, name: 'auto mobile' });
@@ -356,44 +364,65 @@ describe('stop paths: exactly one result card with the right files', () => {
 });
 
 describe('settings changed while recording', () => {
-  test('autoScreen off mid-offer: the offer ends as an audio result, the sharer is not skipped; on again → new offer', async () => {
+  test('autoScreen off mid-offer: the offer ends as an audio result, the sharer is not skipped; on again → new offer (press-to-start)', async () => {
+    // cards off/on gates only the cards: a pressed session goes on, nothing new starts by itself
     const s = await autoScene();
     const first = await autoOffer(s);
-    await press(s, 'config:auto');
-    await oneResult(s, { video: false, name: 'autoScreen off' });
-    assert.ok(!bot.autoSkip.get(s.guild.id)?.has(s.member.id));
-    await press(s, 'config:auto'); // still sharing: evaluated again
-    await waitFor(() => screen.has(s.guild.id), 'new offer');
-    assert.notEqual(screen.get(s.guild.id), first);
+    await press(s, 'config:cards');
+    assert.equal(getSettings(s.guild.id).shareCards, false);
+    await settle();
+    assert.equal(screen.get(s.guild.id), first, 'the session goes on');
+    await press(s, 'config:cards');
+    await settle();
+    assert.equal(screen.get(s.guild.id), first, 'nothing new while it runs');
+    assert.ok(!bot.roomCards.has(s.room.id), 'its room has the session card, no room card');
+    share(s, false);
+    await oneResult(s, { video: false, name: 'share end' });
+    assert.ok(!bot.cardSkip.get(s.guild.id)?.has(s.member.id));
   });
 
-  test('autoScreen off mid-recording (page live): both stop, one card with video + audio', async () => {
+  test('autoScreen off mid-recording (page live): both stop, one card with video + audio (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
-    goLive(rec);
-    await waitFor(() => rec.liveAt, 'live');
-    await press(s, 'config:auto');
-    await oneResult(s, { video: true, name: 'off while live' });
+    goLive(rec.cur.rec);
+    await waitFor(() => rec.cur.rec.liveAt, 'live');
+    await press(s, 'config:cards'); // only cards: the live recording goes on
+    await settle();
+    assert.equal(screen.get(s.guild.id), rec);
+    await press(s, `screen:stop:${rec.began}`, { message: rec.card });
+    await oneResult(s, { video: true, name: 'stopped while live' });
   });
 
-  test('preset "off" (R17) stops a running auto offer', async () => {
+  test('preset "off" (R17) stops a running auto offer (press-to-start)', async () => {
+    // presets are gone (D4): an old preset button is acknowledged and changes nothing
     const s = await autoScene();
-    await autoOffer(s);
-    await press(s, 'config:preset-off');
-    await oneResult(s, { video: false, name: 'preset off' });
+    const rec = await autoOffer(s);
+    const i = await press(s, 'config:preset-off');
+    assert.ok(i.deferredUpdate, 'ignored');
+    assert.equal(getSettings(s.guild.id).shareCards, true);
+    await settle();
+    assert.equal(screen.get(s.guild.id), rec, 'still recording');
+    await press(s, `screen:stop:${rec.began}`, { message: rec.card });
+    await oneResult(s, { video: false, name: 'stopped by hand' });
   });
 
-  test('watched channels changed to another room mid-offer: the offer ends', async () => {
+  test('watched channels changed to another room mid-offer: the offer ends (press-to-start)', async () => {
+    // the room filter gates cards only: a pressed session goes on; the next share in the room gets no card
     const s = await autoScene();
-    await autoOffer(s);
-    const other = fakeMember(s.guild, { name: 'x' }); void other;
+    const rec = await autoOffer(s);
     await updateSettings(s.guild.id, { channels: ['123'] });
     await press(s, 'config:open'); // any later check
     fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
+    await settle();
+    assert.equal(screen.get(s.guild.id), rec, 'the session goes on');
+    share(s, false);
     await oneResult(s, { video: false, name: 'channels' });
+    share(s, true);
+    await settle();
+    assert.ok(!bot.roomCards.has(s.room.id), 'unwatched: no card');
   });
 
-  test('minMembers raised above the head-count mid-offer: the recording goes on (only starts are gated)', async () => {
+  test('minMembers raised above the head-count mid-offer: the recording goes on (only starts are gated) (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
     await updateSettings(s.guild.id, { minMembers: 5 });
@@ -402,7 +431,7 @@ describe('settings changed while recording', () => {
     assert.ok(screen.get(s.guild.id) === rec);
   });
 
-  test('maxMinutes changed mid-recording does not move the running timer (pinned behaviour)', async () => {
+  test('maxMinutes changed mid-recording does not move the running timer (pinned behaviour) (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
     const t = rec.maxTimer;
@@ -411,7 +440,7 @@ describe('settings changed while recording', () => {
     assert.ok(screen.get(s.guild.id) === rec && rec.maxTimer === t);
   });
 
-  test('mode selected while an offer runs: browser is the only mode here, a bogus value is ignored and nothing breaks', async () => {
+  test('mode selected while an offer runs: browser is the only mode here, a bogus value is ignored and nothing breaks (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoOffer(s);
     const i = await press(s, 'config:mode', { kind: 'select', values: ['screen'] });
@@ -450,15 +479,15 @@ describe('settings changed while recording', () => {
       assert.match(content(j.replies[0]), /^🔒/);
     });
 
-    test('the sharer may always stop their own offer, with the toggle off and without admin rights', async () => {
-      const s = await autoScene({}, { admin: false });
+    test('the sharer may always stop their own offer, with the toggle off and without admin rights (press-to-start)', async () => {
+      const s = await autoScene({}, { admin: false }); // the sharer presses their own 🔴 (D9) and their own ⏹️
       const rec = await autoOffer(s);
       assert.equal(getSettings(s.guild.id).anyoneRecords, false);
       await press(s, `screen:stop:${rec.began}`, { message: rec.card });
       await oneResult(s, { video: false, name: 'own stop' });
     });
 
-    test('a non-sharer guest cannot stop someone else\'s offer with the toggle off', async () => {
+    test('a non-sharer guest cannot stop someone else\'s offer with the toggle off (press-to-start)', async () => {
       const s = await autoScene();
       const rec = await autoOffer(s);
       const i = await pressAs(s, s.other, `screen:stop:${rec.began}`, { message: rec.card });
@@ -473,20 +502,27 @@ describe('schedule window closing mid-recording', () => {
   const NOON = '2026-11-09T05:00:00Z'; // Monday 12:00 in Asia/Bangkok
   const EVENING = '2026-11-09T11:00:00Z'; // 18:00
 
-  test('auto offer: the window closes, the next voice event ends it (audio result, sharer not skipped)', async () => {
+  test('auto offer: the window closes, the next voice event ends it (audio result, sharer not skipped) (press-to-start)', async () => {
+    // the schedule gates cards only: the unpressed card goes when the window closes and comes back inside it;
+    // a pressed session is never ended by the window (like a manual one)
     at(NOON);
     const s = await autoScene({ from: 9, to: 17 });
-    await autoOffer(s);
+    share(s);
+    const card = await waitFor(() => bot.roomCards.get(s.room.id)?.card, 'card in the window');
     mock.timers.setTime(new Date(EVENING).getTime());
     fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
-    await oneResult(s, { video: false, name: 'window closed' });
-    assert.ok(!bot.autoSkip.get(s.guild.id)?.has(s.member.id));
-    fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
-    await settle();
-    assert.equal(screen.size, 0, 'no new offer outside the window');
+    await waitFor(() => card.deleted, 'card gone outside the window');
+    assert.ok(!bot.cardSkip.get(s.guild.id)?.has(s.member.id));
+    assert.equal(screen.size + voice.size, 0);
     mock.timers.setTime(new Date(NOON).getTime()); // window open again
     fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
-    await waitFor(() => screen.has(s.guild.id), 'offered inside the window');
+    await waitFor(() => bot.roomCards.get(s.room.id)?.card, 'card again inside the window');
+    const rec = await autoOffer(s);
+    mock.timers.setTime(new Date(EVENING).getTime());
+    rec.seen?.();
+    fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
+    await settle();
+    assert.equal(screen.get(s.guild.id), rec, 'a pressed session outlives the window');
   });
 
   test('a share that starts outside the window is not offered', async () => {
@@ -497,13 +533,14 @@ describe('schedule window closing mid-recording', () => {
     assert.equal(screen.size + voice.size, 0);
   });
 
-  test('overnight window 22-6 closes at 06:00', async () => {
+  test('overnight window 22-6 closes at 06:00 (press-to-start)', async () => {
     at('2026-11-09T16:00:00Z'); // 23:00
     const s = await autoScene({ from: 22, to: 6 });
-    await autoOffer(s);
+    share(s);
+    const card = await waitFor(() => bot.roomCards.get(s.room.id)?.card, 'card at 23:00');
     mock.timers.setTime(new Date('2026-11-09T23:00:00Z').getTime()); // 06:00
     fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
-    await oneResult(s, { video: false, name: 'overnight' });
+    await waitFor(() => card.deleted, 'card gone at 06:00');
   });
 
   test('a manual recording is never stopped by the window', async () => {
@@ -518,32 +555,33 @@ describe('schedule window closing mid-recording', () => {
     assert.ok(screen.get(s.guild.id) === rec && voice.has(s.guild.id));
   });
 
-  test('auto voice for members: window closing ends the room recording once, with one card', async () => {
+  test('auto voice for members: window closing ends the room recording once, with one card (press-to-start)', async () => {
+    // D3: people gathering record nothing (a saved legacy autoVoice 'members' included), inside the window or not
     at(NOON);
     const s = scene(bot);
     await updateSettings(s.guild.id, { autoVoice: 'members', minMembers: 2, from: 9, to: 17 });
     moveMember(fakeMember(s.guild, { name: 'B' }), { channel: s.room });
     fire('voiceStateUpdate', ...moveMember(s.member, { channel: s.room }));
-    await waitFor(() => voice.has(s.guild.id), 'auto voice');
+    await settle();
+    assert.ok(!voice.has(s.guild.id), 'nothing starts');
     mock.timers.setTime(new Date(EVENING).getTime());
     fire('voiceStateUpdate', ...moveMember(fakeMember(s.guild, { name: 'C' }), { channel: s.room }));
-    await waitFor(() => !voice.has(s.guild.id), 'ended');
     await settle();
-    assert.equal(resultsOf(s).length, 1);
-    assert.match(content(lastOf(resultsOf(s)[0])), /นอกเวลาที่ตั้งไว้/);
+    assert.equal(resultsOf(s).length, 0);
+    assert.equal(s.room.sent.length + s.text.sent.length, 0, 'nothing posted');
   });
 });
 
 describe('restart cleanup', () => {
   const restart = async () => { bot._reset(); await fire('clientReady', bot.client); };
 
-  test('cards of two servers, an offer card and a paired screen card are all marked, lists cleared', async () => {
+  test('cards of two servers, an offer card and a paired screen card are all marked, lists cleared (press-to-start)', async () => {
     const a = await autoScene();
     const ra = await autoOffer(a);
     const b = scene(bot);
     const rb = await manualLive(b);
     await rb.cardQ;
-    assert.equal(getSettings(a.guild.id).cards.length, 1);
+    assert.equal(getSettings(a.guild.id).cards.length, 1, 'the session card is remembered');
     await restart();
     await waitFor(() => /บอทรีสตาร์ทระหว่างอัด/.test(content(lastOf(ra.card))) && /บอทรีสตาร์ทระหว่างอัด/.test(content(lastOf(rb.card))), 'both marked');
     assert.deepEqual(lastOf(ra.card).components, []);

@@ -10,7 +10,7 @@ flowchart TB
     subgraph BOT["index.js — router + state ราย guild"]
         R["interactionCreate router"]
         ST["voice: Map guildId → VoiceRecorder<br/>screen: Map guildId → ScreenRecorder | BrowserCapture"]
-        AUTO["checkAutoScreen"]
+        AUTO["checkShares / autoStart"]
     end
     SET["settings.js<br/>data/settings.json"]
     VR["voice-recorder.js<br/>@discordjs/voice → PCM → ffmpeg amix"]

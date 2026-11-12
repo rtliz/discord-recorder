@@ -3,6 +3,7 @@ import { describe, test, beforeEach, afterEach, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadBot, waitFor, sleep, scene, resetFakes } from './helpers/bot.js';
 import { fakeInteraction, fakeMember, moveMember, parts, deferred, FakeVoiceRecorder, FakeScreenRecorder } from './helpers/fakes.js';
+import { startSession, pressRec } from './helpers/session.js';
 
 // QA edge cases for the host-Mac screen (one physical screen for every server) and its stop paths
 
@@ -22,18 +23,13 @@ const resultsOf = (s) => [s.text, s.room].flatMap((c) => [...c.messages.store.va
 const share = (s, on = true) => fire('voiceStateUpdate', ...moveMember(s.member, { streaming: on }));
 const autoScene = async (patch = {}) => {
   const s = scene(bot);
-  await updateSettings(s.guild.id, { autoScreen: true, minMembers: 2, minShareSeconds: 0, mode: 'screen', ...patch });
+  await updateSettings(s.guild.id, { shareCards: true, minMembers: 2, minShareSeconds: 0, mode: 'screen', ...patch });
   s.other = fakeMember(s.guild, { name: 'Other' });
   moveMember(s.other, { channel: s.room });
   return s;
 };
-const autoRec = async (s) => {
-  share(s);
-  const g = s.guild.id;
-  await waitFor(() => screen.get(g)?.paired && voice.get(g), 'auto screen + voice');
-  await screen.get(g).cardQ;
-  return screen.get(g);
-};
+// press-to-start: share → room card → 🔴 → the host Mac records + the bot joins. Resolves the session
+const autoRec = (s) => startSession(bot, s);
 const manualRec = async (s) => {
   const i = await press(s, 'screen:start');
   const rec = screen.get(s.guild.id);
@@ -51,36 +47,37 @@ const oneResult = async (s, name) => {
   assert.ok(l.some((x) => x.includes('ดูวิดีโอ')) && !l.some((x) => x.includes('ฟังเสียง')), `${name}: one video with the audio in it (${l})`);
   assert.deepEqual([FakeScreenRecorder.instances, FakeVoiceRecorder.instances].map((a) => a.map((x) => x.stopped)), [[true], [true]], `${name}: stopped`);
   assert.equal(uploads.length, 1);
-  assert.match(uploads[0], /-with-audio\.\w+$/);
+  assert.match(uploads[0], /-(with-audio|meeting)\.\w+$/);
   return r[0];
 };
 
-beforeEach(() => { bot._reset(); bot.client.guilds.cache.clear(); resetFakes(); // old scenes must not keep reacting (checkAuto sweeps every cached guild)
+beforeEach(() => { bot._reset(); bot.client.guilds.cache.clear(); resetFakes(); // old scenes must not keep reacting (checkShares sweeps every cached guild)
   uploads.length = 0; logs.err.length = 0; mock.timers.reset(); });
 afterEach(() => sleep(80)); // let in-flight starts (voice join, card edits) land before the next test resets the maps
 after(() => { bot._reset(); mock.timers.reset(); });
 
 describe('one host screen across servers', () => {
-  test('auto: a share in B waits while A records, then starts once A\'s file is written', async () => {
+  test('auto: a share in B waits while A records, then starts once A\'s file is written (press-to-start)', async () => {
+    // B's 🔴 while A's Mac records (or still writes its file): refused, nothing started; free again → it works
     const a = await autoScene();
     const b = await autoScene();
     const gate = deferred();
-    await autoRec(a);
-    const ra = screen.get(a.guild.id);
-    ra.stop = async function stop() { this.stopped = true; await gate.promise; this.die(); return `${this.dir}/screen.mp4`; }; // slow ffmpeg finalize
+    const ra = await autoRec(a);
+    ra.cur.rec.stop = async function stop() { this.stopping = this.stopped = true; await gate.promise; this.die(); return `${this.dir}/screen.mp4`; }; // slow ffmpeg finalize
     share(b);
-    await settle();
+    const i = await pressRec(bot, b);
+    assert.match(content(i.replies[0]), /จอเครื่องบอทกำลังถูกอัดอยู่ \(อาจเป็นของ server อื่น\)/);
     assert.equal(FakeScreenRecorder.instances.length, 1, 'B did not start a second ffmpeg');
     assert.equal(screen.has(b.guild.id), false);
-    assert.equal(b.room.sent.length + b.text.sent.length, 0, 'and said nothing');
     share(a, false);
     await waitFor(() => !screen.has(a.guild.id), 'A stopping');
-    fire('voiceStateUpdate', ...moveMember(b.other, { streaming: false })); // any event in B while A still finalizes
-    await settle();
-    assert.equal(screen.has(b.guild.id), false, 'screen still busy while ffmpeg writes the mp4');
+    const j = await pressRec(bot, b);
+    assert.match(content(j.replies[0]), /กำลังถูกอัดอยู่/, 'screen still busy while ffmpeg writes the mp4');
     gate.resolve();
-    await waitFor(() => screen.has(b.guild.id), 'B starts when the screen is free');
-    assert.equal(screen.get(b.guild.id).auto, b.member.id);
+    await waitFor(() => resultsOf(a).length === 1, 'A delivered');
+    await pressRec(bot, b);
+    await waitFor(() => screen.get(b.guild.id)?.cur?.rec.kind === 'mac', 'B starts when the screen is free');
+    assert.equal(screen.get(b.guild.id).cur.owner, b.member.id);
   });
 
   test('manual 🖥️ in B while A records: refused with the "maybe another server" text, nothing started; 🎙️ still works', async () => {
@@ -109,19 +106,23 @@ describe('one host screen across servers', () => {
     assert.ok(screen.has(a.guild.id));
   });
 
-  test('A fails to start (no permission): B can start straight away; A\'s sharer is skipped, one error in A', async () => {
+  test('A\'s Mac fails to start (no permission): the room audio goes on with the error note; B can start straight away', async () => {
     const a = await autoScene();
     const b = await autoScene();
     FakeScreenRecorder.startHook = () => { throw Object.assign(new Error('no permission'), { code: 'SCREEN_PERMISSION' }); };
     share(a);
-    await waitFor(() => bot.autoSkip.get(a.guild.id)?.has(a.member.id), 'A skipped');
-    await waitFor(() => a.room.sent.length === 1, 'error posted once in A');
-    assert.match(content(a.room.sent[0].payload), /อัดจออัตโนมัติไม่ได้/);
+    await pressRec(bot, a);
+    const card = a.room.sent[0];
+    await waitFor(() => /อัดจอเครื่องบอทไม่ได้: no permission/.test(content(lastOf(card))), 'the error on A\'s card');
+    assert.equal(a.room.sent.length, 1, 'one message in A');
+    const sess = screen.get(a.guild.id);
+    assert.equal(sess?.kind, 'session', 'not cancelled: the room is recorded');
+    await waitFor(() => sess.paired, 'room audio');
+    assert.equal(sess.cur, null);
     FakeScreenRecorder.startHook = null;
-    share(b);
-    await waitFor(() => screen.has(b.guild.id), 'B starts');
-    share(a, false); share(a, true); // A retries only after a new share
-    await waitFor(() => bot.autoSkip.get(a.guild.id) && !bot.autoSkip.get(a.guild.id).has(a.member.id) || screen.has(a.guild.id), 'skip cleared');
+    await autoRec(b);
+    share(a, false); // the sharer stops: A ends with the room audio
+    await waitFor(() => !screen.has(a.guild.id) && /^✅ \*\*อัดเสียงในห้องเสร็จแล้ว/.test(content(lastOf(card))), 'A audio result');
   });
 
   test('the same sharer pressing 🖥️ twice quickly starts one ffmpeg', async () => {
@@ -172,13 +173,23 @@ describe('Mac stop paths: one result card with video + audio', () => {
   const autoPaths = {
     'share ends': (s) => share(s, false),
     'sharer leaves': (s) => fire('voiceStateUpdate', ...moveMember(s.member, { channel: null })),
-    'autoScreen off': (s) => press(s, 'config:auto'),
-    'preset off': (s) => press(s, 'config:preset-off'),
+    // only cards are gated by settings: a pressed session goes on until a real stop
+    'autoScreen off': async (s, rec) => {
+      await press(s, 'config:cards');
+      await settle();
+      assert.equal(screen.get(s.guild.id), rec, 'still recording');
+      return press(s, `screen:stop:${rec.began}`, { message: rec.card });
+    },
+    'preset off': async (s, rec) => { // presets are gone (D4): ignored
+      assert.ok((await press(s, 'config:preset-off')).deferredUpdate);
+      assert.equal(screen.get(s.guild.id), rec);
+      return press(s, `screen:stop:${rec.began}`, { message: rec.card });
+    },
     'card ⏹️': (s, rec) => press(s, `screen:stop:${rec.began}`, { message: rec.card }),
     'room card is the screen card: /record stop': (s) => press(s, undefined, { kind: 'slash', command: 'record', sub: 'stop' }),
   };
   for (const [name, stop] of Object.entries(autoPaths)) {
-    test(`auto: ${name}`, async () => {
+    test(`auto: ${name} (press-to-start)`, async () => {
       const s = await autoScene();
       const rec = await autoRec(s);
       await stop(s, rec);
@@ -187,17 +198,18 @@ describe('Mac stop paths: one result card with video + audio', () => {
     });
   }
 
-  test('auto: a stop by hand skips the sharer; max length skips too', async () => {
-    const s = await autoScene({ maxMinutes: 0.001 });
+  test('auto: a stop by hand skips the sharer; max length skips too (press-to-start)', async () => {
+    const s = await autoScene({ maxMinutes: 0.002 });
     await autoRec(s);
     await oneResult(s, 'max');
-    assert.ok(bot.autoSkip.get(s.guild.id)?.has(s.member.id));
+    assert.ok(bot.cardSkip.get(s.guild.id)?.has(s.member.id));
     fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
     await settle();
     assert.equal(screen.size, 0);
+    assert.ok(!bot.roomCards.has(s.room.id), 'no card for the skipped sharer');
   });
 
-  test('auto: mode switched to window/browser mid-recording leaves the running recording alone', async () => {
+  test('auto: mode switched to window/browser mid-recording leaves the running recording alone (press-to-start)', async () => {
     const s = await autoScene();
     const rec = await autoRec(s);
     await press(s, 'config:mode', { kind: 'select', values: ['window'] });
@@ -207,17 +219,24 @@ describe('Mac stop paths: one result card with video + audio', () => {
     assert.ok(screen.get(s.guild.id) === rec);
   });
 
-  test('auto: schedule window closing ends it; reopening starts again (sharer not skipped)', async () => {
+  test('auto: schedule window closing ends it; reopening starts again (sharer not skipped) (press-to-start)', async () => {
+    // the window gates cards only: a pressed Mac session goes on; an unpressed card goes and comes back
     mock.timers.enable({ apis: ['Date'], now: new Date('2026-11-09T05:00:00Z') }); // Mon 12:00 Bangkok
     const s = await autoScene({ from: 9, to: 17 });
-    await autoRec(s);
+    const rec = await autoRec(s);
     mock.timers.setTime(new Date('2026-11-09T11:00:00Z').getTime());
     fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
-    await oneResult(s, 'window closed');
-    assert.ok(!bot.autoSkip.get(s.guild.id)?.has(s.member.id));
+    await settle();
+    assert.equal(screen.get(s.guild.id), rec, 'outlives the window');
+    share(s, false);
+    await oneResult(s, 'share end');
+    assert.ok(!bot.cardSkip.get(s.guild.id)?.has(s.member.id));
+    share(s, true);
+    await settle();
+    assert.ok(!bot.roomCards.has(s.room.id), 'no card outside the window');
     mock.timers.setTime(new Date('2026-11-10T05:00:00Z').getTime());
     fire('voiceStateUpdate', ...moveMember(s.other, { streaming: false }));
-    await waitFor(() => screen.has(s.guild.id), 'restarted in the window');
+    await waitFor(() => bot.roomCards.get(s.room.id), 'card again in the window');
   });
 
   test('a manual recording survives autoScreen off and a closed window', async () => {

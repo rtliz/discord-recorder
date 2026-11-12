@@ -9,7 +9,7 @@ import { join } from 'node:path';
 let n = 0;
 const load = async (file, env = {}) => {
   const saved = {};
-  for (const k of ['SETTINGS_FILE', 'AUTO_SCREEN', 'AUTO_SCREEN_MIN_MEMBERS', 'SCREEN_MODE', 'AUTO_SCREEN_CHANNEL_IDS']) saved[k] = process.env[k];
+  for (const k of ['SETTINGS_FILE', 'AUTO_SCREEN', 'SHARE_CARDS', 'AUTO_SCREEN_MIN_MEMBERS', 'SCREEN_MODE', 'AUTO_SCREEN_CHANNEL_IDS', 'PUBLIC_URL']) saved[k] = process.env[k];
   for (const k of Object.keys(saved)) delete process.env[k];
   Object.assign(process.env, { SETTINGS_FILE: file }, env);
   try {
@@ -23,11 +23,11 @@ const origErr = console.error;
 const quiet = () => { console.error = () => {}; };
 const loud = () => { console.error = origErr; };
 
-test('defaults when there is no file', async () => {
+test('defaults when there is no file (3-way)', async () => {
   const { getSettings } = await load(join(await dir(), 'none.json'));
   const s = getSettings('g1');
   assert.deepEqual(s, {
-    autoScreen: false, autoVoice: 'off', minMembers: 2, mode: 'screen', channels: [], roles: [], notifyChannel: null,
+    shareMode: 'off', shareCards: false, autoVoice: 'off', minMembers: 2, mode: 'screen', area: 'screen', channels: [], roles: [], notifyChannel: null,
     days: [0, 1, 2, 3, 4, 5, 6], from: 0, to: 24, minShareSeconds: 10, maxMinutes: 240,
     anyoneRecords: false, managerRole: null, panels: [],
   });
@@ -38,12 +38,14 @@ test('env values are the defaults', async () => {
     AUTO_SCREEN: 'true', AUTO_SCREEN_MIN_MEMBERS: '4', SCREEN_MODE: 'browser', AUTO_SCREEN_CHANNEL_IDS: '1, 2 ,,3',
   });
   const s = getSettings('g1');
-  assert.equal(s.autoScreen, true);
+  assert.equal(s.shareCards, true); // AUTO_SCREEN is the legacy alias
   assert.equal(s.minMembers, 4);
-  assert.equal(s.mode, 'browser');
+  assert.equal(s.mode, 'screen', 'browser needs PUBLIC_URL: a bot without it has only the host Mac');
   assert.deepEqual(s.channels, ['1', '2', '3']);
   const bad = await load(join(await dir(), 'none.json'), { SCREEN_MODE: 'nonsense', AUTO_SCREEN_MIN_MEMBERS: 'x' });
   assert.equal(bad.getSettings('g').mode, 'screen');
+  const win = await load(join(await dir(), 'none.json'), { SCREEN_MODE: 'window' });
+  assert.equal(win.getSettings('g').mode, 'window');
   assert.equal(bad.getSettings('g').minMembers, 2);
 });
 
@@ -120,16 +122,149 @@ test('write failure resolves false and keeps the in-memory value', async () => {
   assert.equal(await updateSettings('g1', { minMembers: 4 }).finally(loud), false); // queue is not poisoned: next call still resolves
 });
 
-test("legacy autoVoice 'screen' is normalised to 'off'", async () => {
+test("legacy autoVoice 'screen' and 'members' are normalised to 'off'", async () => {
   const d = await dir();
   const file = join(d, 's.json');
   await writeFile(file, JSON.stringify({ g1: { autoVoice: 'screen' }, g2: { autoVoice: 'members' } }));
   const { getSettings } = await load(file);
   assert.equal(getSettings('g1').autoVoice, 'off');
-  assert.equal(getSettings('g2').autoVoice, 'members');
+  assert.equal(getSettings('g2').autoVoice, 'off');
+});
+
+test('shareCards migration matrix (press-to-start)', async () => {
+  const d = await dir();
+  const file = join(d, 's.json');
+  const legacy = {
+    autoOn: { autoScreen: true },
+    autoOnVoiceScreen: { autoScreen: true, autoVoice: 'screen' },
+    members: { autoVoice: 'members' },
+    membersAutoOff: { autoScreen: false, autoVoice: 'members' },
+    autoOff: { autoScreen: false },
+    nothing: { minMembers: 3 },
+    explicitOff: { shareCards: false, autoScreen: true, autoVoice: 'members' }, // an explicit new value wins
+    explicitOn: { shareCards: true, autoScreen: false },
+  };
+  const body = JSON.stringify(legacy, null, 2);
+  await writeFile(file, body);
+  for (const [env, want] of [[{}, { nothing: false, autoOff: false }], [{ SHARE_CARDS: 'true' }, { nothing: true, autoOff: false }], [{ AUTO_SCREEN: 'true' }, { nothing: true, autoOff: false }]]) {
+    const { getSettings } = await load(file, env);
+    const on = (k) => getSettings(k).shareCards;
+    assert.equal(on('autoOn'), true);
+    assert.equal(on('autoOnVoiceScreen'), true);
+    assert.equal(on('members'), true);
+    assert.equal(on('membersAutoOff'), true);
+    assert.equal(on('autoOff'), want.autoOff);
+    assert.equal(on('nothing'), want.nothing); // nothing saved = env default
+    assert.equal(on('explicitOff'), false);
+    assert.equal(on('explicitOn'), true);
+    assert.equal(on('unknownGuild'), want.nothing);
+    for (const k of Object.keys(legacy)) {
+      assert.equal(getSettings(k).autoVoice, 'off', k);
+      assert.ok(!('autoScreen' in getSettings(k)), k);
+    }
+  }
+  assert.equal(await readFile(file, 'utf8'), body, 'load must not rewrite the file');
+});
+
+test('SHARE_CARDS beats AUTO_SCREEN as the env default', async () => {
+  const { getSettings } = await load(join(await dir(), 'none.json'), { SHARE_CARDS: 'false', AUTO_SCREEN: 'true' });
+  assert.equal(getSettings('g').shareCards, false);
+});
+
+test('saving a new value keeps the legacy keys in the file and shareCards wins afterwards', async () => {
+  const d = await dir();
+  const file = join(d, 's.json');
+  await writeFile(file, JSON.stringify({ g1: { autoScreen: true, autoVoice: 'members' } }));
+  const { getSettings, updateSettings } = await load(file);
+  assert.equal(getSettings('g1').shareCards, true);
+  await updateSettings('g1', { shareCards: false });
+  assert.equal(getSettings('g1').shareCards, false);
+  const g1 = JSON.parse(await readFile(file, 'utf8')).g1;
+  assert.deepEqual(g1, { autoScreen: true, autoVoice: 'members', shareCards: false });
+  const again = await load(file);
+  assert.equal(again.getSettings('g1').shareCards, false);
+});
+
+test('shareMode migration matrix and env defaults (3-way)', async () => {
+  const d = await dir();
+  const file = join(d, 's.json');
+  const legacy = {
+    autoOn: { autoScreen: true },                                      // full auto before press-to-start -> auto
+    autoOnVoiceScreen: { autoScreen: true, autoVoice: 'screen' },
+    members: { autoVoice: 'members' },                                 // auto voice for members -> card
+    membersAutoOff: { autoScreen: false, autoVoice: 'members' },
+    autoOff: { autoScreen: false },                                    // explicit old off beats the env
+    nothing: { minMembers: 3 },                                        // env default
+    boolOff: { shareCards: false, autoScreen: true },                  // the A5 boolean beats the legacy keys
+    boolOn: { shareCards: true, autoScreen: true },
+    modeAuto: { shareMode: 'auto', shareCards: false },                // shareMode beats everything
+    modeOff: { shareMode: 'off', shareCards: true, autoScreen: true },
+    modeBogus: { shareMode: 'loud', autoScreen: true },                // unknown value: ignored
+  };
+  const body = JSON.stringify(legacy, null, 2);
+  await writeFile(file, body);
+  const fixed = { autoOn: 'auto', autoOnVoiceScreen: 'auto', members: 'card', membersAutoOff: 'card', autoOff: 'off',
+    boolOff: 'off', boolOn: 'card', modeAuto: 'auto', modeOff: 'off', modeBogus: 'auto' };
+  const envs = [[{}, 'off'], [{ SHARE_CARDS: 'true' }, 'card'], [{ SHARE_CARDS: 'card' }, 'card'], [{ SHARE_CARDS: 'auto' }, 'auto'],
+    [{ SHARE_CARDS: 'off' }, 'off'], [{ AUTO_SCREEN: 'true' }, 'auto'], [{ AUTO_SCREEN: 'false' }, 'off'],
+    [{ SHARE_CARDS: 'false', AUTO_SCREEN: 'true' }, 'off'], [{ SHARE_CARDS: 'nonsense' }, 'off']];
+  for (const [env, def] of envs) {
+    const { getSettings } = await load(file, env);
+    const what = JSON.stringify(env);
+    for (const [k, want] of Object.entries(fixed)) {
+      assert.equal(getSettings(k).shareMode, want, `${k} ${what}`);
+      assert.equal(getSettings(k).shareCards, want !== 'off', `${k} shareCards ${what}`);
+    }
+    assert.equal(getSettings('nothing').shareMode, def, `nothing ${what}`);
+    assert.equal(getSettings('unknownGuild').shareMode, def, `unknown ${what}`);
+  }
+  assert.equal(await readFile(file, 'utf8'), body, 'load must not rewrite the file');
+});
+
+test('saving shareMode keeps the legacy keys and wins afterwards (3-way)', async () => {
+  const d = await dir();
+  const file = join(d, 's.json');
+  await writeFile(file, JSON.stringify({ g1: { autoScreen: true, shareCards: true } }));
+  const { getSettings, updateSettings } = await load(file);
+  assert.equal(getSettings('g1').shareMode, 'card');
+  await updateSettings('g1', { shareMode: 'auto' });
+  assert.equal(getSettings('g1').shareMode, 'auto');
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')).g1, { autoScreen: true, shareCards: true, shareMode: 'auto' });
+  assert.equal((await load(file)).getSettings('g1').shareMode, 'auto');
 });
 
 test('anyoneRecords defaults to false', async () => {
   const { getSettings } = await load(join(await dir(), 'none.json'));
   assert.equal(getSettings('g').anyoneRecords, false);
+});
+
+test('with PUBLIC_URL: mode is agent (default) or browser; legacy screen/window and env SCREEN_MODE read as agent, file untouched', async () => {
+  const pub = { PUBLIC_URL: 'https://rec.example.com' };
+  const fresh = await load(join(await dir(), 'none.json'), pub);
+  assert.equal(fresh.getSettings('new').mode, 'agent');
+  for (const [env, want] of [['screen', 'agent'], ['window', 'agent'], ['browser', 'browser'], ['agent', 'agent'], ['junk', 'agent']]) {
+    const m = await load(join(await dir(), 'none.json'), { ...pub, SCREEN_MODE: env });
+    assert.equal(m.getSettings('g').mode, want, `SCREEN_MODE=${env}`);
+  }
+  const d = await dir(), file = join(d, 's.json');
+  const raw = JSON.stringify({ a: { mode: 'screen' }, b: { mode: 'window' }, c: { mode: 'browser' }, d: { mode: 'agent' } });
+  await writeFile(file, raw);
+  const { getSettings } = await load(file, pub);
+  assert.deepEqual(['a', 'b', 'c', 'd'].map((g) => getSettings(g).mode), ['agent', 'agent', 'browser', 'agent']);
+  assert.equal(await readFile(file, 'utf8'), raw, 'read-time only');
+});
+
+test('capture area: default screen; only discord or screen are ever read', async () => {
+  const d = await dir(), file = join(d, 's.json');
+  await writeFile(file, JSON.stringify({ a: { area: 'discord' }, b: { area: 'window' }, c: {} }));
+  const { getSettings } = await load(file);
+  assert.deepEqual(['a', 'b', 'c', 'new'].map((g) => getSettings(g).area), ['discord', 'screen', 'screen', 'screen']);
+});
+
+test('env CAPTURE_AREA is the default area; a saved area still wins', async () => {
+  const d = await dir(), file = join(d, 's.json');
+  await writeFile(file, JSON.stringify({ a: { area: 'screen' } }));
+  const m = await load(file, { CAPTURE_AREA: 'discord' });
+  assert.deepEqual(['a', 'new'].map((g) => m.getSettings(g).area), ['screen', 'discord']);
+  assert.equal((await load(join(d, 'n.json'), { CAPTURE_AREA: 'bogus' })).getSettings('x').area, 'screen');
 });

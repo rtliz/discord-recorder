@@ -4,11 +4,12 @@ import assert from 'node:assert/strict';
 import { loadBot, waitFor, scene, resetFakes } from './helpers/bot.js';
 import { fakeInteraction, fakeMember, moveMember, parts, ids, FakeScreenRecorder } from './helpers/fakes.js';
 import { assertDiscordLimits } from './helpers/limits.js';
+import { startSession } from './helpers/session.js';
 
 // index.js flows with the host-Mac screen (ffmpeg) modes and no browser capture
 
 const { bot, uploads, fire } = await loadBot({ SCREEN_ENABLED: 'true', PUBLIC_URL: '' });
-const { updateSettings } = await import('../src/settings.js');
+const { updateSettings, getSettings } = await import('../src/settings.js');
 const { voice, screen } = bot;
 const content = (p) => p?.content ?? '';
 const lastEdit = (m) => m.edits.at(-1) ?? m.payload;
@@ -43,18 +44,22 @@ test('manual 🖥️: card from the deferred reply, the bot joins the presser\'s
   assert.equal(voice.size + screen.size, 0);
 });
 
-test('auto: a share in a full room starts the screen + room audio; share ends → result', async () => {
+test('auto: a share in a full room starts the screen + room audio; share ends → result (press-to-start)', async () => {
   const s = scene(bot);
   const g = s.guild.id;
-  await updateSettings(g, { autoScreen: true, minMembers: 2, minShareSeconds: 0, mode: 'screen' });
+  await updateSettings(g, { shareCards: true, minMembers: 2, minShareSeconds: 0, mode: 'screen' });
   moveMember(fakeMember(s.guild, { name: 'B' }), { channel: s.room });
   fire('voiceStateUpdate', ...moveMember(s.member, { streaming: true }));
-  await waitFor(() => screen.get(g)?.paired && voice.get(g), 'auto screen + voice');
-  const rec = screen.get(g);
-  assert.equal(rec.auto, s.member.id);
+  await waitFor(() => bot.roomCards.get(s.room.id)?.card, 'room card');
+  assert.equal(FakeScreenRecorder.instances.length + voice.size, 0, 'a share alone starts nothing');
+  const sess = await startSession(bot, s); // 🔴: the host Mac records (no agent), the bot joins
+  assert.equal(sess.cur.rec.kind, 'mac');
+  assert.equal(sess.cur.owner, s.member.id);
+  assert.match(content(lastEdit(sess.card)), new RegExp(`^🔴 \\*\\*กำลังอัดจอเครื่องบอท\\*\\* — <@${s.member.id}> แชร์จอ ในห้อง \\*\\*Meeting\\*\\*`));
   fire('voiceStateUpdate', ...moveMember(s.member, { streaming: false }));
-  await waitFor(() => !screen.has(g) && /^✅/.test(content(lastEdit(rec.card))), 'result');
+  await waitFor(() => !screen.has(g) && /^✅/.test(content(lastEdit(sess.card))), 'result');
   assert.equal(voice.size, 0);
+  assert.ok(FakeScreenRecorder.instances[0].stopped);
 });
 
 test('ffmpeg dying on its own ends the recording with a warning', async () => {
@@ -84,15 +89,17 @@ const press = (s, customId, extra = {}) => {
   return fire('interactionCreate', i).then(() => i);
 };
 
-test('U15: the "share" preset in Mac mode says the bot records the screen itself', async () => {
+test('U15 (new quick page): host Mac only: the share select (auto records the host Mac), no อัดจอด้วย / กรอบอัด selects', async () => {
   const s = scene(bot);
   const i = await press(s, 'config:open');
-  assert.match(content(i.replies[0]), /มีคนแชร์จอ บอทอัดจอ \+ เสียงในห้องให้เอง หยุดเมื่อเลิกแชร์/);
-  assert.doesNotMatch(content(i.replies[0]), /ส่งปุ่มให้คนแชร์/);
   assertDiscordLimits(i.replies[0], 'mac quick page');
-  const p = await press(s, 'config:preset-share');
-  assert.match(content(p.updates[0]), /บอทอัดจอ \+ เสียงในห้องให้เอง/);
-  assertDiscordLimits(p.updates[0], 'mac quick page after preset');
+  const ids = parts(i.replies[0]).map((c) => c.custom_id);
+  assert.ok(ids.includes('config:share'));
+  assert.ok(!ids.includes('config:mode') && !ids.includes('config:area'), 'agent / browser / area need PUBLIC_URL');
+  const p = await press(s, 'config:cards'); // an old message's toggle still works
+  assertDiscordLimits(p.updates[0], 'mac quick page after the toggle');
+  await press(s, 'config:share-auto');
+  assert.equal(getSettings(s.guild.id).shareMode, 'auto', 'auto works on the host Mac too (old flow)');
 });
 
 test('U24/U3: the Mac live card, with and without the room audio', async () => {

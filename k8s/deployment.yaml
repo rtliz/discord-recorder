@@ -20,6 +20,20 @@ data:
   CAPTURE_MAX_MB: "3072"                      # ต่อการอัดจอ 1 ครั้ง
   CAPTURE_TOTAL_MB: "8192"                    # รวมทุกการอัดจอที่ยังค้างในเครื่อง (emptyDir 20Gi, ตอนแปลงไฟล์ใช้อีกเท่าตัว)
   DELETE_AFTER_UPLOAD: "true"                 # อัปโหลด Drive สำเร็จแล้วลบไฟล์ในเครื่อง
+  AGENT_CODE_PAIRING: "false"                 # ปิดการจับคู่ด้วยรหัส 6 หลัก (ใช้เฉพาะ dev ที่รัน npm run agent) บน k8s ใช้แค่คำสั่งติดตั้งที่มี token
+  # AGENTS_FILE: "/app/data/agents.json"      # ที่เก็บ credential ของตัวอัด (ค่าเริ่มต้น data/agents.json อยู่บน PVC อยู่แล้ว)
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: discord-recorder-data
+  namespace: discord-recorder
+spec:
+  accessModes: [ReadWriteOnce]
+  # storageClassName: standard   # ใส่ชื่อ storage class ของ cluster ถ้าไม่มี default class (ดู: kubectl get storageclass)
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -66,14 +80,14 @@ spec:
             capabilities: { drop: ["ALL"] }
           volumeMounts:
             - { name: recordings, mountPath: /app/recordings }
-            - { name: data, mountPath: /app/data }   # per-server settings (settings.json)
+            - { name: data, mountPath: /app/data }   # settings.json + agents.json (ต้องอยู่รอดตอน restart ไม่งั้นตัวอัดต้องจับคู่ใหม่)
       volumes:
         - name: recordings
           emptyDir:
             sizeLimit: 20Gi   # PCM ดิบ ~11.5MB/นาที/คนที่พูด; video ≈0.9GB/ชม. ต่อคน ×2 ตอนแปลงไฟล์
-        # emptyDir: การตั้งค่าหายเมื่อ pod ถูกสร้างใหม่ ถ้าต้องการให้อยู่ถาวร เปลี่ยนเป็น persistentVolumeClaim
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: discord-recorder-data
 ---
 apiVersion: v1
 kind: Service

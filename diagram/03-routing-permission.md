@@ -32,7 +32,9 @@ flowchart TD
     SC -->|"ใช่"| OFF["ปิดการอัดหน้าจอไว้"]
     SC -->|"ไม่"| D{"cmd"}
     D -->|"settings / config:open"| CFG["แสดง configView แบบ ephemeral"]
-    D -->|"config:auto/min/mode/voice/..."| UPD["updateSettings → แสดง configView<br/>→ checkAutoScreen"]
+    D -->|"config:cards/min/mode/..."| UPD["updateSettings → แสดง configView<br/>→ checkShares"]
+    D -->|"screen:rec / cont / switch (กดจากการ์ด)"| SES["session: อัดจอคนแชร์ ต่อ หรือเปลี่ยน<br/>กดได้ถ้า canRecord หรือเป็นคนแชร์ของปุ่มนั้นเอง ดู 6 และ 12"]
+    D -->|"agent (/agent, agent:revoke)"| AGT["ephemeral: คำสั่งติดตั้งตัวอัด + รายการเครื่อง<br/>ไม่ต้องผ่าน canRecord ลงทะเบียนเมื่อมี PUBLIC_URL"]
     D -->|"config:anyone (👥 บนหน้าแบบง่าย)"| ANY["สลับ anyoneRecords<br/>ผู้ดูแลเท่านั้น ซ่อนเมื่อมี ALLOWED_USER_IDS"]
     D -->|"config:done"| DONE["แสดงสรุปที่บันทึก"]
     D -->|"perm"| PERM["open x-apple.systempreferences<br/>บนเครื่องที่รันบอท"]

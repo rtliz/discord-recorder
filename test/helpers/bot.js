@@ -1,5 +1,5 @@
 import { writeFile } from 'node:fs/promises';
-import { FakeVoiceRecorder, FakeScreenRecorder, fakeGuild, fakeTextChannel, fakeVoiceChannel, fakeMember, moveMember } from './fakes.js';
+import { FakeVoiceRecorder, FakeScreenRecorder, FakeAgentHub, fakeComposeMeeting, fakeGuild, fakeTextChannel, fakeVoiceChannel, fakeMember, moveMember } from './fakes.js';
 
 // loads src/index.js with fakes in place of voice/ffmpeg/Drive. Import ./env.js first (tmp cwd + settings).
 // Never logs in: index.js only registers commands / logs in when run as `node src/index.js`.
@@ -17,6 +17,8 @@ export async function loadBot(env = {}) {
   }
   const bot = await import('../../src/index.js');
   const uploads = [];
+  const agents = new FakeAgentHub(); // deps.agents / deps.composeMeeting exist from index.js B1 on; before that these are inert keys
+  const composeMeeting = fakeComposeMeeting();
   Object.assign(bot.deps, {
     VoiceRecorder: FakeVoiceRecorder,
     ScreenRecorder: FakeScreenRecorder,
@@ -27,6 +29,11 @@ export async function loadBot(env = {}) {
       await writeFile(f, 'merged');
       return f;
     },
+    agents,
+    composeMeeting: (args, opts) => { // bot.deps.composeFails (an Error) makes it throw, like mergeFails
+      composeMeeting.fails = bot.deps.composeFails ?? null;
+      return composeMeeting(args, opts);
+    },
     uploadToDrive: async (file, name) => {
       if (bot.deps.uploadFails) throw bot.deps.uploadFails;
       uploads.push(name);
@@ -35,7 +42,9 @@ export async function loadBot(env = {}) {
   });
   bot.client.user = { id: 'bot', username: 'Recorder', tag: 'Recorder#0000', setPresence() {} };
   const fire = (ev, ...args) => bot.client.listeners(ev)[0](...args);
-  return { bot, logs, uploads, fire };
+  // a member starts/stops streaming in their voice room, and the bot hears it
+  const share = (member, on = true) => fire('voiceStateUpdate', ...moveMember(member, { streaming: on }));
+  return { bot, logs, uploads, fire, agents, composed: composeMeeting, share };
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -65,4 +74,5 @@ export function resetFakes() {
   FakeScreenRecorder.instances.length = 0;
   FakeVoiceRecorder.startHook = null;
   FakeScreenRecorder.startHook = null;
+  for (const a of FakeAgentHub.instances) a._reset();
 }
