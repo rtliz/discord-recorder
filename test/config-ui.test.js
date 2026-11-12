@@ -248,3 +248,31 @@ test('quickPage / detailPage / applyConfig (pure API)', () => {
   assert.deepEqual(applyConfig('config:macmode', ['window'], s, { ...O, browser: false }), { mode: 'window' });
   for (const id of ['preset-x', 'open', 'bogus', 'page-quick']) assert.equal(configPageOf(id), id === 'page-quick' ? 'quick' : 'quick', id);
 });
+
+test('🔧 ห้อง & คน: labelled pickers (`name: value`) on a small server; NONE clears; a big server keeps Discord pickers', async () => {
+  const { Collection, ChannelType } = await import('discord.js');
+  const col = (xs) => new Collection(xs.map((x) => [x.id, x]));
+  const g = {
+    id: 'g-w',
+    channels: { cache: col([{ id: 'v1', name: 'Meeting', type: ChannelType.GuildVoice, rawPosition: 1 }, { id: 't1', name: 'อัดหน้าจอ', type: ChannelType.GuildText, rawPosition: 0 }]) },
+    roles: { cache: col([{ id: 'g-w', name: '@everyone', rawPosition: 0 }, { id: 'r1', name: 'AD', rawPosition: 2 }, { id: 'bot', name: 'Recorder', managed: true, rawPosition: 3 }]) },
+  };
+  const s = { channels: [], roles: ['r1'], notifyChannel: 't1', managerRole: 'r1', days: [1], from: 0, to: 24, minMembers: 1, minShareSeconds: 0, maxMinutes: 60 };
+  const v = detailPage(s, { screenEnabled: true, browser: true, guild: g }, 'where');
+  assertDiscordLimits(v, 'where');
+  const rows = v.components.slice(1).map((r) => r.toJSON().components[0]);
+  assert.deepEqual(rows.map((c) => c.custom_id), ['config:channels', 'config:roles', 'config:notify', 'config:manager']);
+  const chosen = (c) => c.options.filter((o) => o.default).map((o) => o.label);
+  assert.deepEqual(chosen(rows[0]), ['📍 ห้องที่เฝ้า: ทุกห้อง']);
+  assert.deepEqual(chosen(rows[1]), ['👤 role ที่แชร์จอแล้วให้อัด: AD']);
+  assert.deepEqual(chosen(rows[2]), ['📣 ห้องแจ้งผล: อัดหน้าจอ']);
+  assert.deepEqual(chosen(rows[3]), ['🔑 role ที่กดอัดได้: AD']);
+  assert.ok(!rows[1].options.some((o) => /everyone|Recorder/.test(o.label)), 'no @everyone or bot roles');
+  assert.deepEqual(applyConfig('config:channels', ['-']), { channels: [] });
+  assert.deepEqual(applyConfig('config:channels', ['-', 'v1']), { channels: ['v1'] });
+  assert.deepEqual(applyConfig('config:notify', ['-']), { notifyChannel: null });
+  assert.deepEqual(applyConfig('config:manager', ['r1']), { managerRole: 'r1' });
+  const big = { ...g, channels: { cache: col(Array.from({ length: 30 }, (_, k) => ({ id: `v${k}`, name: `r${k}`, type: ChannelType.GuildVoice }))) } };
+  const vb = detailPage(s, { screenEnabled: true, browser: true, guild: big }, 'where');
+  assert.equal(vb.components[1].toJSON().components[0].type, 8, 'over 24 rooms: Discord channel picker');
+});

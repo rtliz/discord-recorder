@@ -86,6 +86,24 @@ const select = (id, name, current, options, { multi = false } = {}) => wrap(new 
     default: multi ? current.map(String).includes(String(value)) : String(value) === String(current),
   }))));
 const btn = (id, text, style = ButtonStyle.Secondary) => new ButtonBuilder().setCustomId(`config:${id}`).setLabel(text).setStyle(style);
+// the 🔧 ห้อง & คน pickers as labelled string selects: [id, name] lists of the server's rooms / roles (null = unknown)
+const listOf = (cache, ok, sort) => (typeof cache?.filter === 'function' ? [...cache.filter(ok).values()].sort(sort).map((x) => [x.id, x.name]) : null);
+const byPos = (a, b) => (a.rawPosition ?? a.position ?? 0) - (b.rawPosition ?? b.position ?? 0);
+const voiceRooms = (g) => listOf(g?.channels.cache, (c) => c.type === ChannelType.GuildVoice || c.type === ChannelType.GuildStageVoice, byPos);
+const textRooms = (g) => listOf(g?.channels.cache, (c) => c.type === ChannelType.GuildText, byPos);
+const roleList = (g) => listOf(g?.roles.cache, (r) => r.id !== g.id && !r.managed, (a, b) => byPos(b, a));
+const NONE = '-'; // the "nothing chosen" option of a labelled picker
+// one labelled option per item plus the "nothing chosen" one (default when nothing is set); null when the server has
+// more than 24 (Discord's 25-option cap), then the caller falls back to Discord's own picker
+const pick = (id, name, current, items, noneText, { multi = false } = {}) => {
+  if (!items || items.length > 24) return null;
+  const chosen = current.filter((x) => items.some(([k]) => k === x));
+  return wrap(new StringSelectMenuBuilder().setCustomId(`config:${id}`).setPlaceholder(name)
+    .setMinValues(1).setMaxValues(multi ? items.length + 1 : 1)
+    .addOptions([[NONE, noneText], ...items].map(([value, text]) => ({
+      value, label: `${name}: ${text}`.slice(0, 100), default: value === NONE ? !chosen.length : chosen.includes(value),
+    }))));
+};
 
 // the quick page's choices: [value, label, description]
 const SHARE_OPTS = [['auto', '⚡ อัดอัตโนมัติ', 'บอทเข้าห้องและอัดทันทีที่มีคนแชร์จอ'],
@@ -122,10 +140,11 @@ export function applyConfig(customId, values = [], s = {}, { screenEnabled = tru
     min: () => n('minMembers', v[0]),
     delay: () => n('minShareSeconds', v[0]),
     max: () => n('maxMinutes', v[0]),
-    channels: () => ({ channels: v }),
-    roles: () => ({ roles: v }),
-    notify: () => ({ notifyChannel: v[0] ?? null }),
-    manager: () => ({ managerRole: v[0] ?? null }),
+    // the labelled pickers add a NONE option ("ทุกห้อง" / "ทุกคน" / ...): picking it alone clears the setting
+    channels: () => ({ channels: v.filter((x) => x !== NONE) }),
+    roles: () => ({ roles: v.filter((x) => x !== NONE) }),
+    notify: () => ({ notifyChannel: v.find((x) => x !== NONE) ?? null }),
+    manager: () => ({ managerRole: v.find((x) => x !== NONE) ?? null }),
     days: () => ({ days: [...new Set(v.map(Number).filter((d) => Number.isInteger(d) && d >= 0 && d <= 6))].sort((a, b) => a - b) }),
     from: () => n('from', v[0]),
     to: () => n('to', v[0]),
@@ -169,20 +188,26 @@ export function detailPage(s, { screenEnabled, browser = false, modes = DEFAULT_
         ? [select('macmode', 'อัดจอ', effectiveMode(s, modes), modes.map((m) => [m, label.mode(m), m === 'window' ? 'อัดเฉพาะหน้าต่างของเครื่องที่รันบอท' : 'อัดทั้งจอของเครื่องที่รันบอท']))] : []),
     ],
     where: [
-      wrap(new ChannelSelectMenuBuilder().setCustomId('config:channels')
-        .setPlaceholder('📍 ห้องเสียงที่เฝ้า (ไม่เลือก = ทุกห้อง)')
-        .setChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
-        .setMinValues(0).setMaxValues(25).setDefaultChannels(keep(s.channels, guild?.channels.cache))),
-      wrap(new RoleSelectMenuBuilder().setCustomId('config:roles')
-        .setPlaceholder('👤 role ที่แชร์จอแล้วให้อัด (ไม่เลือก = ทุกคน)')
-        .setMinValues(0).setMaxValues(25).setDefaultRoles(keep(s.roles, guild?.roles.cache))),
-      wrap(new ChannelSelectMenuBuilder().setCustomId('config:notify')
-        .setPlaceholder('📣 ห้องที่ส่งการ์ด/แจ้งผลการอัด (ไม่เลือก = แชทของห้องเสียง)')
-        .setChannelTypes(ChannelType.GuildText)
-        .setMinValues(0).setMaxValues(1).setDefaultChannels(keep(s.notifyChannel ? [s.notifyChannel] : [], guild?.channels.cache))),
-      wrap(new RoleSelectMenuBuilder().setCustomId('config:manager')
-        .setPlaceholder('🔑 role ที่กดอัด/หยุดได้ (ไม่เลือก = เฉพาะผู้ดูแล server)')
-        .setMinValues(0).setMaxValues(1).setDefaultRoles(keep(s.managerRole ? [s.managerRole] : [], guild?.roles.cache))),
+      // a labelled string select (`name: value`, like the other tabs) when the server is small enough, else Discord's own
+      // channel / role picker (it can't show a label once something is chosen)
+      pick('channels', '📍 ห้องที่เฝ้า', s.channels, voiceRooms(guild), 'ทุกห้อง', { multi: true })
+        ?? wrap(new ChannelSelectMenuBuilder().setCustomId('config:channels')
+          .setPlaceholder('📍 ห้องเสียงที่เฝ้า (ไม่เลือก = ทุกห้อง)')
+          .setChannelTypes(ChannelType.GuildVoice, ChannelType.GuildStageVoice)
+          .setMinValues(0).setMaxValues(25).setDefaultChannels(keep(s.channels, guild?.channels.cache))),
+      pick('roles', '👤 role ที่แชร์จอแล้วให้อัด', s.roles, roleList(guild), 'ทุกคน', { multi: true })
+        ?? wrap(new RoleSelectMenuBuilder().setCustomId('config:roles')
+          .setPlaceholder('👤 role ที่แชร์จอแล้วให้อัด (ไม่เลือก = ทุกคน)')
+          .setMinValues(0).setMaxValues(25).setDefaultRoles(keep(s.roles, guild?.roles.cache))),
+      pick('notify', '📣 ห้องแจ้งผล', s.notifyChannel ? [s.notifyChannel] : [], textRooms(guild), 'แชทของห้องเสียง')
+        ?? wrap(new ChannelSelectMenuBuilder().setCustomId('config:notify')
+          .setPlaceholder('📣 ห้องที่ส่งการ์ด/แจ้งผลการอัด (ไม่เลือก = แชทของห้องเสียง)')
+          .setChannelTypes(ChannelType.GuildText)
+          .setMinValues(0).setMaxValues(1).setDefaultChannels(keep(s.notifyChannel ? [s.notifyChannel] : [], guild?.channels.cache))),
+      pick('manager', '🔑 role ที่กดอัดได้', s.managerRole ? [s.managerRole] : [], roleList(guild), 'เฉพาะผู้ดูแล server')
+        ?? wrap(new RoleSelectMenuBuilder().setCustomId('config:manager')
+          .setPlaceholder('🔑 role ที่กดอัด/หยุดได้ (ไม่เลือก = เฉพาะผู้ดูแล server)')
+          .setMinValues(0).setMaxValues(1).setDefaultRoles(keep(s.managerRole ? [s.managerRole] : [], guild?.roles.cache))),
     ],
     time: [
       select('days', '🗓️ วันที่ใช้ (การ์ดและอัดอัตโนมัติ)', s.days, DAYS.map((d, n) => [n, `วัน${d}`]), { multi: true }),
